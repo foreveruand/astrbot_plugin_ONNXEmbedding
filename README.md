@@ -1,10 +1,12 @@
 # ONNXEmbedding - AstrBot ONNX 嵌入向量生成插件
 
-一个为 [AstrBot](https://github.com/AstrBotDevs/astrbot) 框架设计的 **ONNX Runtime** 嵌入向量生成插件，相比传统的 Sentence Transformers 方案具有更低的配置要求和更快的推理速度。
+一个为 [AstrBot](https://github.com/AstrBotDevs/astrbot) 框架设计的 **ONNX Runtime** 嵌入向量生成和文本对话插件，相比传统的 PyTorch 方案具有更低的配置要求和更快的推理速度。
 
 ## 功能特性
 
 - 🚀 **ONNX Runtime 加速**: 使用 ONNX Runtime 推理引擎，无需 PyTorch，配置要求更低
+- 🤖 **文本对话支持**: 支持 ONNX 文本生成模型（Chat Provider）
+- 📦 **嵌入向量生成**: 支持 ONNX Embedding 模型
 - 📦 **轻量级部署**: 相比 PyTorch 版本，内存占用和磁盘空间需求大幅减少
 - 🔧 **无缝集成**: 作为 AstrBot 的 Provider 适配器，可直接在框架配置中使用
 - 📦 **自动配置注册**: 插件启动时自动注册配置项到 AstrBot 全局配置
@@ -94,7 +96,16 @@ pip install onnxruntime tokenizers numpy
 
 可以在插件配置里面选择开机自启，第一次需要用户手动操作启动。使用指令 `/onnx register` 将提供商注册到嵌入向量提供者，然后可以通过嵌入式模型的创建页面创建这个嵌入向量提供者。
 
-### 2. 插件命令
+### 2. 作为文本对话提供者（Chat Provider）
+
+插件同时支持 ONNX 文本生成模型作为聊天对话提供者：
+
+1. 在 AstrBot 的 Provider Source 中添加 `ONNXChat` 类型
+2. 配置 `ONNXChat_model_path` 指向 ONNX 模型目录
+3. 配置生成参数（temperature、max_new_tokens 等）
+4. 在 Provider 设置中选择创建的 ONNXChat Provider
+
+### 3. 插件命令
 
 使用 `/onnx help` 获取帮助：
 
@@ -102,6 +113,36 @@ pip install onnxruntime tokenizers numpy
 - `/onnx redb` - 重新加载数据库
 - `/onnx kbinfo` - 获取所有数据库以及其对应的 embedding_provider_id
 - `/onnx unload [embedding_provider_id]` - 卸载指定 Provider 的权重
+
+## ONNX Chat Provider 配置
+
+### Chat Provider 专属配置参数
+
+| 参数名 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `ONNXChat_model_path` | string | `""` | ONNX 聊天模型路径（必填） |
+| `ONNXChat_tokenizer_path` | string | `""` | Tokenizer 路径（可选） |
+| `ONNXChat_model_name` | string | `"onnx-chat-model"` | 模型显示名称 |
+| `ONNXChat_max_length` | int | `512` | 最大输入序列长度 |
+| `ONNXChat_max_new_tokens` | int | `128` | 最大生成token数 |
+| `ONNXChat_temperature` | float | `0.8` | 采样温度（0-2） |
+| `ONNXChat_top_p` | float | `0.9` | Top-p 采样（0-1） |
+| `ONNXChat_top_k` | int | `50` | Top-k 采样 |
+
+### 推荐的 ONNX 聊天模型
+
+| 模型 | 大小 | 说明 |
+|------|------|------|
+| `gpt2` (ONNX) | ~500MB | OpenAI GPT-2 基础版 |
+| `TinyLlama-1.1B` (ONNX) | ~2GB | 轻量级 Llama 模型 |
+| `opt-125m` (ONNX) | ~250MB | Meta OPT 125M |
+
+**注意**: 需要将 PyTorch 模型转换为 ONNX 格式才能使用。可以使用以下命令转换：
+
+```bash
+pip install optimum[exporters]
+optimum-cli export onnx --model gpt2 ./gpt2-onnx/
+```
 
 ## 模型支持
 
@@ -295,6 +336,14 @@ pip install onnxruntime-directml
 - 如果问题仍然存在，尝试降低 `max_length` 到 128 或 512
 
 ## 版本历史
+
+### v1.1.0
+
+- 新增 ONNX Chat Provider，支持文本对话功能
+- 支持自回归文本生成（GPT 类模型）
+- 支持流式输出
+- 可配置的生成参数（temperature、top_p、top_k）
+- 优化模型加载逻辑
 
 ### v1.0.0
 

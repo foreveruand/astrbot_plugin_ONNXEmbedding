@@ -20,6 +20,9 @@ from astrbot.core.provider.register import (
     register_provider_adapter,
 )
 
+# 导入 Chat Provider
+from .provider_chat import ONNXChatProvider, register_ONNXChatProvider
+
 DEFAULT_MODEL_NAME = "all-MiniLM-L6-v2"
 DEFAULT_ONNX_URL = "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx"
 
@@ -468,6 +471,56 @@ class ONNXEmbedding(Star):
 
         if not already_registered:
             register_ONNXEmbeddingProvider()
+
+        # ---- Chat Provider 注册 ----
+        chat_already_registered = False
+        if isinstance(provider_registry, list):
+            for p in provider_registry:
+                if getattr(p, "type", None) == "ONNXChat":
+                    chat_already_registered = True
+                    break
+
+        if not chat_already_registered:
+            register_ONNXChatProvider()
+            # 注册 Chat Provider 配置
+            try:
+                CONFIG_METADATA_2["provider_group"]["metadata"]["provider"][
+                    "config_template"
+                ]["ONNXChat"] = {
+                    "id": "ONNXChat",
+                    "type": "ONNXChat",
+                    "provider": "Local",
+                    "ONNXChat_model_path": "",
+                    "ONNXChat_tokenizer_path": "",
+                    "ONNXChat_model_name": "onnx-chat-model",
+                    "ONNXChat_max_length": 512,
+                    "ONNXChat_max_new_tokens": 128,
+                    "ONNXChat_temperature": 0.8,
+                    "ONNXChat_top_p": 0.9,
+                    "ONNXChat_top_k": 50,
+                    "provider_type": "chat_completion",
+                    "enable": True,
+                }
+                CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"][
+                    "ONNXChat_model_path"
+                ] = {
+                    "description": "ONNX 聊天模型路径（目录或.onnx文件）",
+                    "type": "string",
+                }
+                CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"][
+                    "ONNXChat_max_new_tokens"
+                ] = {
+                    "description": "最大生成token数（默认128）",
+                    "type": "int",
+                }
+                CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"][
+                    "ONNXChat_temperature"
+                ] = {
+                    "description": "采样温度（默认0.8）",
+                    "type": "float",
+                }
+            except KeyError:
+                logger.warning("[ONNXChat] 无法注册 Chat Provider 配置")
 
         self._registered = True
         logger.info("[ONNXEmbedding] 配置与 Provider 注册完成")
