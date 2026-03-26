@@ -1,0 +1,9 @@
+{
+  "auto_start": {
+    "description": "是否开机自动注册Provider",
+    "type": "int",
+    "enum": [0, 1],
+    "enum_descriptions": ["否", "是"],
+    "default": 0
+  }
+}
