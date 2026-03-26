@@ -175,9 +175,40 @@ class ONNXEmbeddingProvider(EmbeddingProvider):
 
         logger.info(f"[ONNXEmbedding] 使用执行提供程序: {selected_providers}")
 
-        return ort.InferenceSession(
-            str(model_path), sess_options, providers=selected_providers
-        )
+        # 尝试禁用特定的优化器来避免兼容性问题
+        disabled_optimizers = None
+        if optimization_level == "disable":
+            # 禁用可能导致问题的 LayerNorm 和 Attention 优化器
+            disabled_optimizers = [
+                "SimplifiedLayerNormFusion",
+                "LayerNormFusion",
+                "AttentionFusion",
+                "BiasSoftmaxFusion",
+            ]
+            logger.info(f"[ONNXEmbedding] 禁用优化器: {disabled_optimizers}")
+
+        try:
+            return ort.InferenceSession(
+                str(model_path),
+                sess_options,
+                providers=selected_providers,
+                disabled_optimizers=disabled_optimizers,
+            )
+        except Exception as e:
+            # 如果失败，尝试不使用任何优化
+            logger.warning(f"[ONNXEmbedding] 加载模型失败，尝试不优化加载: {e}")
+            sess_options.graph_optimization_level = (
+                ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+            )
+            return ort.InferenceSession(
+                str(model_path),
+                sess_options,
+                providers=selected_providers,
+                disabled_optimizers=[
+                    "SimplifiedLayerNormFusion",
+                    "LayerNormFusion",
+                ],
+            )
 
     async def _ensure_model_loaded(self):
         """

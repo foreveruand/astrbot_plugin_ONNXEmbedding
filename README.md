@@ -227,15 +227,44 @@ pip install onnxruntime-directml
 
 #### 3. 图优化错误（Attempting to get index by a name which does not exist）
 
-如果遇到类似 `Attempting to get index by a name which does not exist: InsertedPrecisionFreeCast_...` 的错误，说明模型与 ONNX Runtime 的图优化器不兼容。
+如果遇到类似 `Attempting to get index by a name which does not exist: InsertedPrecisionFreeCast_...` 的错误，说明模型文件可能损坏或与当前 ONNX Runtime 版本不兼容。
 
-**解决方案：**
-- 默认配置已禁用图优化（`ONNXEmbedding_optimization_level: disable`）
-- 如需启用优化，可尝试设置为 `basic` 或 `extended`，但不要使用 `all`
-- 或者重新下载模型：
-  ```bash
-  python download_model.py --model Xenova/all-MiniLM-L6-v2
-  ```
+**解决方案（按优先级）：**
+
+1. **重新下载模型（推荐）：**
+   ```bash
+   # 删除旧模型
+   rm -rf ./models/all-MiniLM-L6-v2
+   
+   # 重新下载
+   python download_model.py --model Xenova/all-MiniLM-L6-v2
+   ```
+
+2. **检查模型完整性：**
+   确保 `model.onnx` 文件大小正确（约 80-120MB），如果文件过小可能下载不完整。
+
+3. **尝试其他模型源：**
+   ```bash
+   # 使用 onnx-community 的版本
+   python download_model.py --model onnx-community/all-MiniLM-L6-v2-ONNX
+   
+   # 或使用 onnx-models 的版本
+   python download_model.py --model onnx-models/all-MiniLM-L6-v2-onnx
+   ```
+
+4. **手动转换模型：**
+   如果预转换的模型都有问题，可以使用 optimum 自己转换：
+   ```bash
+   pip install optimum[exporters]
+   optimum-cli export onnx --model sentence-transformers/all-MiniLM-L6-v2 ./my-model/
+   ```
+
+5. **检查 ONNX Runtime 版本：**
+   ```bash
+   pip show onnxruntime
+   # 建议升级到最新版本
+   pip install -U onnxruntime
+   ```
 
 #### 4. 配置未注册
 
