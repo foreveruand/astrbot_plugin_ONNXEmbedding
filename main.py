@@ -133,8 +133,34 @@ class ONNXEmbeddingProvider(EmbeddingProvider):
 
         # 配置ONNX Runtime会话
         sess_options = ort.SessionOptions()
-        sess_options.graph_optimization_level = (
-            ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+        # 根据配置决定是否启用图优化
+        # 某些模型（特别是经过LayerNorm优化的）可能与图优化器不兼容
+        optimization_level = self.provider_config.get(
+            "ONNXEmbedding_optimization_level", "disable"
+        )
+
+        if optimization_level == "all":
+            sess_options.graph_optimization_level = (
+                ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            )
+        elif optimization_level == "basic":
+            sess_options.graph_optimization_level = (
+                ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+            )
+        elif optimization_level == "extended":
+            sess_options.graph_optimization_level = (
+                ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
+            )
+        else:
+            # 默认禁用图优化，避免节点名称不匹配问题
+            sess_options.graph_optimization_level = (
+                ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+            )
+
+        logger.info(
+            f"[ONNXEmbedding] 图优化级别: {optimization_level} "
+            f"({sess_options.graph_optimization_level})"
         )
 
         # 自动选择执行提供程序
@@ -334,6 +360,7 @@ class ONNXEmbedding(Star):
                 "provider": "Local",
                 "ONNXEmbedding_path": DEFAULT_MODEL_NAME,
                 "ONNXEmbedding_tokenizer_path": "",
+                "ONNXEmbedding_optimization_level": "disable",
                 "provider_type": "embedding",
                 "enable": True,
                 "embedding_dimensions": 384,
@@ -353,6 +380,12 @@ class ONNXEmbedding(Star):
                 "ONNXEmbedding_tokenizer_path"
             ] = {
                 "description": "Tokenizer 文件路径（可选，默认从模型目录查找）",
+                "type": "string",
+            }
+            CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"][
+                "ONNXEmbedding_optimization_level"
+            ] = {
+                "description": "ONNX Runtime 图优化级别（disable/basic/extended/all），默认disable避免兼容性问题",
                 "type": "string",
             }
         except KeyError:
@@ -387,6 +420,9 @@ class ONNXEmbedding(Star):
             )
             CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"].pop(
                 "ONNXEmbedding_tokenizer_path", None
+            )
+            CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"].pop(
+                "ONNXEmbedding_optimization_level", None
             )
         except KeyError:
             pass

@@ -77,6 +77,7 @@ pip install onnxruntime tokenizers numpy
 |--------|------|--------|------|
 | `ONNXEmbedding_path` | string | `"all-MiniLM-L6-v2"` | ONNX 模型路径，支持相对路径和绝对路径，可以是目录或.onnx文件 |
 | `ONNXEmbedding_tokenizer_path` | string | `""` | Tokenizer 文件路径，可选，默认从模型目录自动查找 |
+| `ONNXEmbedding_optimization_level` | string | `"disable"` | 图优化级别：`disable`/`basic`/`extended`/`all`，默认禁用以避免兼容性问题 |
 | `embedding_dimensions` | integer | `384` | 嵌入向量的维度 |
 | `enable` | boolean | `true` | 是否启用该 provider |
 | `provider_type` | string | `"embedding"` | Provider 类型 |
@@ -109,15 +110,51 @@ pip install onnxruntime tokenizers numpy
 
 ### 如何获取 ONNX 模型
 
-1. **从 Hugging Face 下载转换后的模型**: 许多 Sentence Transformer 模型已经有社区转换的 ONNX 版本
-   
-2. **手动转换**: 使用 `optimum` 库将 PyTorch 模型转换为 ONNX 格式：
+#### 方法 1：使用下载脚本（推荐）
+
+插件提供了便捷的下载脚本：
+
+```bash
+# 下载默认模型 (Xenova/all-MiniLM-L6-v2)
+python download_model.py
+
+# 下载其他模型
+python download_model.py --model Xenova/all-MiniLM-L6-v2
+
+# 指定输出目录
+python download_model.py --output /path/to/models
+```
+
+#### 方法 2：从 Hugging Face 手动下载
+
+1. **使用 huggingface-cli**（需要安装 huggingface_hub）：
    ```bash
-   pip install optimum[exporters]
-   optimum-cli export onnx --model sentence-transformers/all-MiniLM-L6-v2 ./onnx-model/
+   pip install huggingface-hub
+   
+   # 下载模型
+   huggingface-cli download Xenova/all-MiniLM-L6-v2 --local-dir ./models/all-MiniLM-L6-v2
    ```
 
-3. **使用预转换模型**: 推荐从 [Hugging Face](https://huggingface.co/models?library=onnx) 下载已转换的 ONNX 模型
+2. **使用 git-lfs**（需要安装 git-lfs）：
+   ```bash
+   git lfs install
+   git clone https://huggingface.co/Xenova/all-MiniLM-L6-v2 ./models/all-MiniLM-L6-v2
+   ```
+
+3. **手动下载文件**：
+   访问 [Hugging Face 模型页面](https://huggingface.co/Xenova/all-MiniLM-L6-v2/tree/main)，下载以下文件：
+   - `onnx/model.onnx` → 重命名为 `model.onnx`
+   - `tokenizer.json`
+   - `config.json`
+   - `tokenizer_config.json`
+
+#### 方法 3：手动转换 PyTorch 模型
+
+使用 `optimum` 库将 PyTorch 模型转换为 ONNX 格式：
+```bash
+pip install optimum[exporters]
+optimum-cli export onnx --model sentence-transformers/all-MiniLM-L6-v2 ./onnx-model/
+```
 
 ### 模型目录结构
 
@@ -131,8 +168,15 @@ model_dir/
 
 ### 推荐模型
 
-- `sentence-transformers/all-MiniLM-L6-v2` (推荐，英语，384维)
-- `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (多语言，384维)
+以下模型已经过测试，可直接使用：
+
+| 模型 | 语言 | 维度 | 大小 | 说明 |
+|------|------|------|------|------|
+| `Xenova/all-MiniLM-L6-v2` | 英语 | 384 | ~80MB | ⭐ 推荐，ONNX 专用优化版本 |
+| `Xenova/paraphrase-multilingual-MiniLM-L12-v2` | 多语言 | 384 | ~120MB | ⭐ 推荐，多语言支持 |
+| `sentence-transformers/all-MiniLM-L6-v2` | 英语 | 384 | ~80MB | 原版模型（需手动转换） |
+
+**推荐使用 Xenova 组织的模型**，这些模型专为 ONNX Runtime 优化，下载即可使用。
 
 ## 性能对比
 
@@ -181,13 +225,25 @@ pip install onnxruntime-directml
 - 确认 model.onnx 文件存在且完整
 - 检查 tokenizer.json 是否存在
 
-#### 3. 配置未注册
+#### 3. 图优化错误（Attempting to get index by a name which does not exist）
+
+如果遇到类似 `Attempting to get index by a name which does not exist: InsertedPrecisionFreeCast_...` 的错误，说明模型与 ONNX Runtime 的图优化器不兼容。
+
+**解决方案：**
+- 默认配置已禁用图优化（`ONNXEmbedding_optimization_level: disable`）
+- 如需启用优化，可尝试设置为 `basic` 或 `extended`，但不要使用 `all`
+- 或者重新下载模型：
+  ```bash
+  python download_model.py --model Xenova/all-MiniLM-L6-v2
+  ```
+
+#### 4. 配置未注册
 
 - 确认插件已正确加载
 - 检查插件初始化日志
 - 重启 AstrBot
 
-#### 4. Tokenizer 未找到
+#### 5. Tokenizer 未找到
 
 - 确保模型目录包含 `tokenizer.json` 文件
 - 或在配置中显式指定 `ONNXEmbedding_tokenizer_path`
