@@ -95,7 +95,7 @@ class ONNXEmbeddingProvider(EmbeddingProvider):
             raise RuntimeError(f"[ONNXEmbedding] 环境不可用: {self._env_error}")
 
     def _load_tokenizer(self) -> Any:
-        """加载tokenizer"""
+        """加载tokenizer并配置padding和truncation"""
         from tokenizers import Tokenizer
 
         tokenizer_path = Path(self.tokenizer_path)
@@ -103,17 +103,42 @@ class ONNXEmbeddingProvider(EmbeddingProvider):
             tokenizer_path = Path(StarTools.get_data_dir()) / tokenizer_path
 
         if tokenizer_path.exists():
-            return Tokenizer.from_file(str(tokenizer_path))
+            tokenizer = Tokenizer.from_file(str(tokenizer_path))
+        else:
+            # 尝试在模型目录中查找
+            model_dir = Path(self.model_path)
+            if model_dir.is_dir():
+                for tokenizer_file in ["tokenizer.json", "tokenizer_config.json"]:
+                    candidate = model_dir / tokenizer_file
+                    if candidate.exists():
+                        tokenizer = Tokenizer.from_file(str(candidate))
+                        break
+                else:
+                    raise FileNotFoundError(f"找不到tokenizer文件: {tokenizer_path}")
+            else:
+                raise FileNotFoundError(f"找不到tokenizer文件: {tokenizer_path}")
 
-        # 尝试在模型目录中查找
-        model_dir = Path(self.model_path)
-        if model_dir.is_dir():
-            for tokenizer_file in ["tokenizer.json", "tokenizer_config.json"]:
-                candidate = model_dir / tokenizer_file
-                if candidate.exists():
-                    return Tokenizer.from_file(str(candidate))
+        # 从配置中获取最大序列长度，默认为256
+        max_length = self.provider_config.get("ONNXEmbedding_max_length", 256)
 
-        raise FileNotFoundError(f"找不到tokenizer文件: {tokenizer_path}")
+        # 配置truncation
+        tokenizer.enable_truncation(max_length=max_length)
+
+        # 配置padding - pad到max_length
+        # 尝试找到合适的pad_token_id
+        pad_id = 0  # 默认使用0作为pad_id
+        try:
+            # 尝试获取[PAD] token的id
+            if tokenizer.token_to_id("[PAD]") is not None:
+                pad_id = tokenizer.token_to_id("[PAD]")
+            elif tokenizer.token_to_id("<pad>") is not None:
+                pad_id = tokenizer.token_to_id("<pad>")
+        except Exception:
+            pass
+
+        tokenizer.enable_padding(pad_id=pad_id, length=max_length)
+
+        return tokenizer
 
     def _load_onnx_session(self) -> Any:
         """加载ONNX模型session"""
@@ -392,6 +417,7 @@ class ONNXEmbedding(Star):
                 "ONNXEmbedding_path": DEFAULT_MODEL_NAME,
                 "ONNXEmbedding_tokenizer_path": "",
                 "ONNXEmbedding_optimization_level": "disable",
+                "ONNXEmbedding_max_length": 256,
                 "provider_type": "embedding",
                 "enable": True,
                 "embedding_dimensions": 384,
@@ -418,6 +444,12 @@ class ONNXEmbedding(Star):
             ] = {
                 "description": "ONNX Runtime 图优化级别（disable/basic/extended/all），默认disable避免兼容性问题",
                 "type": "string",
+            }
+            CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"][
+                "ONNXEmbedding_max_length"
+            ] = {
+                "description": "最大序列长度（默认256），超过会被截断",
+                "type": "int",
             }
         except KeyError:
             logger.error("[ONNXEmbedding] AstrBot 配置结构异常，无法注册 Provider")
@@ -454,6 +486,9 @@ class ONNXEmbedding(Star):
             )
             CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"].pop(
                 "ONNXEmbedding_optimization_level", None
+            )
+            CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"].pop(
+                "ONNXEmbedding_max_length", None
             )
         except KeyError:
             pass

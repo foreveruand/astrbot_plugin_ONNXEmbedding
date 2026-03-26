@@ -78,6 +78,7 @@ pip install onnxruntime tokenizers numpy
 | `ONNXEmbedding_path` | string | `"all-MiniLM-L6-v2"` | ONNX 模型路径，支持相对路径和绝对路径，可以是目录或.onnx文件 |
 | `ONNXEmbedding_tokenizer_path` | string | `""` | Tokenizer 文件路径，可选，默认从模型目录自动查找 |
 | `ONNXEmbedding_optimization_level` | string | `"disable"` | 图优化级别：`disable`/`basic`/`extended`/`all`，默认禁用以避免兼容性问题 |
+| `ONNXEmbedding_max_length` | int | `256` | 最大序列长度，超过会被截断 |
 | `embedding_dimensions` | integer | `384` | 嵌入向量的维度 |
 | `enable` | boolean | `true` | 是否启用该 provider |
 | `provider_type` | string | `"embedding"` | Provider 类型 |
@@ -276,6 +277,22 @@ pip install onnxruntime-directml
 
 - 确保模型目录包含 `tokenizer.json` 文件
 - 或在配置中显式指定 `ONNXEmbedding_tokenizer_path`
+
+#### 6. 形状不匹配错误（inhomogeneous shape）
+
+如果遇到 `setting an array element with a sequence. The requested array has an inhomogeneous shape` 错误，说明输入序列长度不一致。
+
+**原因：** Tokenizer 没有正确配置 padding，导致不同长度的输入无法组成 batch。
+
+**解决方案：**
+- 确保使用最新版本的插件代码（已修复）
+- 在配置中设置 `ONNXEmbedding_max_length`（默认 256）：
+  ```json
+  {
+    "ONNXEmbedding_max_length": 256
+  }
+  ```
+- 如果问题仍然存在，尝试降低 `max_length` 到 128 或 512
 
 ## 版本历史
 
