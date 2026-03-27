@@ -513,7 +513,7 @@ class ONNXEmbeddingProvider(EmbeddingProvider):
     ) -> np.ndarray:
         import openvino as ov
 
-        input_names = [inp.any_name for inp in model.inputs()]
+        input_names = [inp.any_name for inp in model.inputs]
         feed_dict = {}
 
         if "input_ids" in input_names:
@@ -526,7 +526,7 @@ class ONNXEmbeddingProvider(EmbeddingProvider):
         infer_request = model.create_infer_request()
         infer_request.infer(feed_dict)
 
-        output_names = [out.any_name for out in model.outputs()]
+        output_names = [out.any_name for out in model.outputs]
 
         if "sentence_embedding" in output_names:
             embeddings = infer_request.get_tensor("sentence_embedding").data[:]

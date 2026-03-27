@@ -405,7 +405,7 @@ class ONNXRerankProvider(RerankProvider):
     ) -> np.ndarray:
         import openvino as ov
 
-        input_names = [inp.any_name for inp in model.inputs()]
+        input_names = [inp.any_name for inp in model.inputs]
         feed_dict = {}
 
         if "input_ids" in input_names:
