@@ -21,6 +21,7 @@ from astrbot.core.provider.register import (
     provider_registry,
     register_provider_adapter,
 )
+from astrbot.core.star.filter.command import GreedyStr
 
 from .rerank_provider import ONNXRerankProvider, register_ONNXRerankProvider
 
@@ -765,10 +766,13 @@ class ONNXEmbedding(Star):
             )
 
     @onnx.command("query")
-    async def query_kb(self, event: AstrMessageEvent, kb_name: str, *query_parts: str):
-        query_text = " ".join(query_parts)
+    async def query_kb(
+        self, event: AstrMessageEvent, kb_name: str, query_text: GreedyStr = ""
+    ):
         if not query_text:
-            yield event.plain_result("[ONNXEmbedding] 请提供查询内容")
+            yield event.plain_result(
+                "[ONNXEmbedding] 用法: /onnx query <知识库名> <查询内容>"
+            )
             return
 
         kb_manager = self.context.kb_manager
