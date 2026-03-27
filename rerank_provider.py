@@ -6,6 +6,7 @@ ONNX Rerank Provider for AstrBot
 import asyncio
 import gc
 import sys
+import time
 from pathlib import Path
 from typing import Any
 from urllib.request import urlretrieve
@@ -82,6 +83,11 @@ class ONNXRerankProvider(RerankProvider):
         self.hf_mirror = provider_config.get("huggingface_mirror", "")
         self.auto_download = provider_config.get("auto_download", 1) == 1
 
+        self.auto_unload_timeout = provider_config.get("auto_unload_timeout", 0)
+        self._last_used_time: float = 0
+        self._auto_unload_task: asyncio.Task | None = None
+        self._shutdown_event = asyncio.Event()
+
         base_path = provider_config.get("ONNXRerank_path", DEFAULT_RERANK_MODEL)
         data_dir = Path(StarTools.get_data_dir("ONNXEmbedding"))
         base_path = Path(base_path)
@@ -150,8 +156,6 @@ class ONNXRerankProvider(RerankProvider):
         return tokenizer
 
     def _load_onnx_session(self) -> Any:
-        import onnxruntime as ort
-
         model_path = Path(self.model_path)
 
         if model_path.is_dir():
@@ -163,6 +167,25 @@ class ONNXRerankProvider(RerankProvider):
         if not model_path.exists():
             raise FileNotFoundError(f"找不到ONNX模型文件: {model_path}")
 
+        try:
+            import openvino as ov
+
+            core = ov.Core()
+            devices = core.available_devices
+            preferred_device = "GPU" if "GPU" in devices else "CPU"
+            logger.info(
+                f"[ONNXRerank] OpenVINO 可用设备: {devices}, 使用: {preferred_device}"
+            )
+            compiled_model = core.compile_model(str(model_path), preferred_device)
+            logger.info("[ONNXRerank] 使用 OpenVINO 后端加载模型成功")
+            return ("openvino", compiled_model)
+        except ImportError:
+            logger.info("[ONNXRerank] OpenVINO 未安装，使用 ONNX Runtime")
+        except Exception as e:
+            logger.warning(f"[ONNXRerank] OpenVINO 加载失败: {e}，回退到 ONNX Runtime")
+
+        import onnxruntime as ort
+
         sess_options = ort.SessionOptions()
         sess_options.graph_optimization_level = (
             ort.GraphOptimizationLevel.ORT_DISABLE_ALL
@@ -172,17 +195,21 @@ class ONNXRerankProvider(RerankProvider):
         preferred_order = [
             "CUDAExecutionProvider",
             "ROCMExecutionProvider",
-            "DirectMLExecutionProvider",
+            "DmlExecutionProvider",
+            "OpenVINOExecutionProvider",
             "CPUExecutionProvider",
         ]
         selected_providers = [p for p in preferred_order if p in providers]
 
-        logger.info(f"[ONNXRerank] 使用执行提供程序: {selected_providers}")
+        logger.info(f"[ONNXRerank] ONNX Runtime 提供程序: {selected_providers}")
 
-        return ort.InferenceSession(
-            str(model_path),
-            sess_options,
-            providers=selected_providers,
+        return (
+            "onnxruntime",
+            ort.InferenceSession(
+                str(model_path),
+                sess_options,
+                providers=selected_providers,
+            ),
         )
 
     async def _ensure_model_loaded(self):
@@ -203,6 +230,8 @@ class ONNXRerankProvider(RerankProvider):
             try:
                 self.tokenizer = await loop.run_in_executor(None, self._load_tokenizer)
                 self.session = await loop.run_in_executor(None, self._load_onnx_session)
+                self._update_last_used_time()
+                self._start_auto_unload_task()
                 logger.info("[ONNXRerank] 模型加载成功")
             except Exception as e:
                 logger.error("[ONNXRerank] 模型加载失败", exc_info=True)
@@ -262,6 +291,56 @@ class ONNXRerankProvider(RerankProvider):
             logger.error("[ONNXRerank] 资源清理失败", exc_info=True)
             return False
 
+    def _update_last_used_time(self):
+        self._last_used_time = time.time()
+
+    def _start_auto_unload_task(self):
+        if self.auto_unload_timeout <= 0:
+            return
+        if self._auto_unload_task is not None and not self._auto_unload_task.done():
+            return
+
+        self._shutdown_event.clear()
+        self._auto_unload_task = asyncio.create_task(self._auto_unload_loop())
+        logger.info(
+            f"[ONNXRerank] 已启动自动卸载任务，超时时间: {self.auto_unload_timeout} 分钟"
+        )
+
+    async def _auto_unload_loop(self):
+        check_interval = min(60, self.auto_unload_timeout * 60 / 2)
+        check_interval = max(10, check_interval)
+
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.sleep(check_interval)
+
+                if self.session is None:
+                    continue
+
+                elapsed = time.time() - self._last_used_time
+                timeout_seconds = self.auto_unload_timeout * 60
+
+                if elapsed >= timeout_seconds:
+                    logger.info(
+                        f"[ONNXRerank] 模型已 {self.auto_unload_timeout} 分钟未使用，自动卸载"
+                    )
+                    async with self._model_lock:
+                        if self.session is not None:
+                            self._cleanup_resources()
+                            logger.info("[ONNXRerank] 模型已自动卸载")
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"[ONNXRerank] 自动卸载检查出错: {e}")
+
+    def _stop_auto_unload_task(self):
+        if self._auto_unload_task is not None:
+            self._shutdown_event.set()
+            if not self._auto_unload_task.done():
+                self._auto_unload_task.cancel()
+            self._auto_unload_task = None
+
     async def rerank(
         self,
         query: str,
@@ -272,6 +351,7 @@ class ONNXRerankProvider(RerankProvider):
             return []
 
         await self._ensure_model_loaded()
+        self._update_last_used_time()
 
         loop = asyncio.get_running_loop()
         scores = await loop.run_in_executor(
@@ -313,7 +393,45 @@ class ONNXRerankProvider(RerankProvider):
             input_ids[i, : len(ids)] = ids
             attention_mask[i, : len(mask)] = mask
 
-        input_names = [inp.name for inp in self.session.get_inputs()]
+        backend, model = self.session
+
+        if backend == "openvino":
+            return self._compute_scores_openvino(model, input_ids, attention_mask)
+        else:
+            return self._compute_scores_onnxruntime(model, input_ids, attention_mask)
+
+    def _compute_scores_openvino(
+        self, model, input_ids: np.ndarray, attention_mask: np.ndarray
+    ) -> np.ndarray:
+        import openvino as ov
+
+        input_names = [inp.any_name for inp in model.inputs()]
+        feed_dict = {}
+
+        if "input_ids" in input_names:
+            feed_dict["input_ids"] = ov.Tensor(input_ids)
+        if "attention_mask" in input_names:
+            feed_dict["attention_mask"] = ov.Tensor(attention_mask)
+        if "token_type_ids" in input_names:
+            feed_dict["token_type_ids"] = ov.Tensor(np.zeros_like(input_ids))
+
+        infer_request = model.create_infer_request()
+        infer_request.infer(feed_dict)
+
+        logits = list(infer_request.results.values())[0].data[:]
+
+        if len(logits.shape) == 2:
+            scores = logits[:, 0]
+        else:
+            scores = logits.flatten()
+
+        scores = 1 / (1 + np.exp(-scores))
+        return scores
+
+    def _compute_scores_onnxruntime(
+        self, session, input_ids: np.ndarray, attention_mask: np.ndarray
+    ) -> np.ndarray:
+        input_names = [inp.name for inp in session.get_inputs()]
         feed_dict = {}
 
         if "input_ids" in input_names:
@@ -323,7 +441,7 @@ class ONNXRerankProvider(RerankProvider):
         if "token_type_ids" in input_names:
             feed_dict["token_type_ids"] = np.zeros_like(input_ids)
 
-        outputs = self.session.run(None, feed_dict)
+        outputs = session.run(None, feed_dict)
 
         logits = outputs[0]
 
@@ -333,10 +451,10 @@ class ONNXRerankProvider(RerankProvider):
             scores = logits.flatten()
 
         scores = 1 / (1 + np.exp(-scores))
-
         return scores
 
     async def unload_model(self) -> bool:
+        self._stop_auto_unload_task()
         async with self._model_lock:
             if self.session is None:
                 logger.info("[ONNXRerank] 模型未加载，无需卸载")
@@ -346,6 +464,7 @@ class ONNXRerankProvider(RerankProvider):
             return await loop.run_in_executor(None, self._cleanup_resources)
 
     def force_unload_sync(self) -> bool:
+        self._stop_auto_unload_task()
         if self.session is None:
             return True
         return self._cleanup_resources()

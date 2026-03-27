@@ -6,6 +6,7 @@ ONNX Embedding Provider for AstrBot
 import asyncio
 import gc
 import sys
+import time
 from pathlib import Path
 from typing import Any
 from urllib.request import urlretrieve
@@ -130,6 +131,12 @@ class ONNXEmbeddingProvider(EmbeddingProvider):
         )
         self.auto_download = provider_config.get("auto_download", 1) == 1
 
+        # -------- 自动卸载配置 --------
+        self.auto_unload_timeout = provider_config.get("auto_unload_timeout", 0)
+        self._last_used_time: float = 0
+        self._auto_unload_task: asyncio.Task | None = None
+        self._shutdown_event = asyncio.Event()
+
         # -------- 模型路径处理（Pathlib）--------
         base_path = provider_config.get("ONNXEmbedding_path", DEFAULT_MODEL_NAME)
 
@@ -225,12 +232,8 @@ class ONNXEmbeddingProvider(EmbeddingProvider):
         return tokenizer
 
     def _load_onnx_session(self) -> Any:
-        """加载ONNX模型session"""
-        import onnxruntime as ort
-
         model_path = Path(self.model_path)
 
-        # 如果路径是目录，查找model.onnx文件
         if model_path.is_dir():
             onnx_files = list(model_path.glob("*.onnx"))
             if not onnx_files:
@@ -240,11 +243,35 @@ class ONNXEmbeddingProvider(EmbeddingProvider):
         if not model_path.exists():
             raise FileNotFoundError(f"找不到ONNX模型文件: {model_path}")
 
-        # 配置ONNX Runtime会话
-        sess_options = ort.SessionOptions()
+        backend = self.provider_config.get("ONNXEmbedding_backend", "auto")
 
-        # 根据配置决定是否启用图优化
-        # 某些模型（特别是经过LayerNorm优化的）可能与图优化器不兼容
+        if backend in ("openvino", "auto"):
+            try:
+                import openvino as ov
+
+                core = ov.Core()
+                devices = core.available_devices
+                preferred_device = "GPU" if "GPU" in devices else "CPU"
+                logger.info(
+                    f"[ONNXEmbedding] OpenVINO 可用设备: {devices}, 使用: {preferred_device}"
+                )
+                compiled_model = core.compile_model(str(model_path), preferred_device)
+                logger.info(f"[ONNXEmbedding] 使用 OpenVINO 后端加载模型成功")
+                return ("openvino", compiled_model)
+            except ImportError:
+                if backend == "openvino":
+                    raise RuntimeError("未安装 openvino，请执行：pip install openvino")
+                logger.info("[ONNXEmbedding] OpenVINO 未安装，使用 ONNX Runtime")
+            except Exception as e:
+                if backend == "openvino":
+                    raise RuntimeError(f"OpenVINO 加载模型失败: {e}")
+                logger.warning(
+                    f"[ONNXEmbedding] OpenVINO 加载失败: {e}，回退到 ONNX Runtime"
+                )
+
+        import onnxruntime as ort
+
+        sess_options = ort.SessionOptions()
         optimization_level = self.provider_config.get(
             "ONNXEmbedding_optimization_level", "disable"
         )
@@ -262,61 +289,57 @@ class ONNXEmbeddingProvider(EmbeddingProvider):
                 ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
             )
         else:
-            # 默认禁用图优化，避免节点名称不匹配问题
             sess_options.graph_optimization_level = (
                 ort.GraphOptimizationLevel.ORT_DISABLE_ALL
             )
 
-        logger.info(
-            f"[ONNXEmbedding] 图优化级别: {optimization_level} "
-            f"({sess_options.graph_optimization_level})"
-        )
-
-        # 自动选择执行提供程序
         providers = ort.get_available_providers()
         preferred_order = [
             "CUDAExecutionProvider",
             "ROCMExecutionProvider",
-            "DirectMLExecutionProvider",
+            "DmlExecutionProvider",
+            "OpenVINOExecutionProvider",
             "CPUExecutionProvider",
         ]
         selected_providers = [p for p in preferred_order if p in providers]
 
-        logger.info(f"[ONNXEmbedding] 使用执行提供程序: {selected_providers}")
+        logger.info(f"[ONNXEmbedding] ONNX Runtime 提供程序: {selected_providers}")
 
-        # 尝试禁用特定的优化器来避免兼容性问题
         disabled_optimizers = None
         if optimization_level == "disable":
-            # 禁用可能导致问题的 LayerNorm 和 Attention 优化器
             disabled_optimizers = [
                 "SimplifiedLayerNormFusion",
                 "LayerNormFusion",
                 "AttentionFusion",
                 "BiasSoftmaxFusion",
             ]
-            logger.info(f"[ONNXEmbedding] 禁用优化器: {disabled_optimizers}")
 
         try:
-            return ort.InferenceSession(
-                str(model_path),
-                sess_options,
-                providers=selected_providers,
-                disabled_optimizers=disabled_optimizers,
+            return (
+                "onnxruntime",
+                ort.InferenceSession(
+                    str(model_path),
+                    sess_options,
+                    providers=selected_providers,
+                    disabled_optimizers=disabled_optimizers,
+                ),
             )
         except Exception as e:
-            # 如果失败，尝试不使用任何优化
             logger.warning(f"[ONNXEmbedding] 加载模型失败，尝试不优化加载: {e}")
             sess_options.graph_optimization_level = (
                 ort.GraphOptimizationLevel.ORT_DISABLE_ALL
             )
-            return ort.InferenceSession(
-                str(model_path),
-                sess_options,
-                providers=selected_providers,
-                disabled_optimizers=[
-                    "SimplifiedLayerNormFusion",
-                    "LayerNormFusion",
-                ],
+            return (
+                "onnxruntime",
+                ort.InferenceSession(
+                    str(model_path),
+                    sess_options,
+                    providers=selected_providers,
+                    disabled_optimizers=[
+                        "SimplifiedLayerNormFusion",
+                        "LayerNormFusion",
+                    ],
+                ),
             )
 
     async def _ensure_model_loaded(self):
@@ -337,6 +360,8 @@ class ONNXEmbeddingProvider(EmbeddingProvider):
             try:
                 self.tokenizer = await loop.run_in_executor(None, self._load_tokenizer)
                 self.session = await loop.run_in_executor(None, self._load_onnx_session)
+                self._update_last_used_time()
+                self._start_auto_unload_task()
                 logger.info("[ONNXEmbedding] 模型加载成功")
             except Exception as e:
                 logger.error("[ONNXEmbedding] 模型加载失败", exc_info=True)
@@ -389,9 +414,6 @@ class ONNXEmbeddingProvider(EmbeddingProvider):
         return path_str
 
     def _cleanup_resources(self) -> bool:
-        """
-        统一的模型 / 显存 / 内存清理逻辑
-        """
         try:
             self.session = None
             self.tokenizer = None
@@ -401,76 +423,153 @@ class ONNXEmbeddingProvider(EmbeddingProvider):
             logger.error("[ONNXEmbedding] 资源清理失败", exc_info=True)
             return False
 
+    def _update_last_used_time(self):
+        self._last_used_time = time.time()
+
+    def _start_auto_unload_task(self):
+        if self.auto_unload_timeout <= 0:
+            return
+        if self._auto_unload_task is not None and not self._auto_unload_task.done():
+            return
+
+        self._shutdown_event.clear()
+        self._auto_unload_task = asyncio.create_task(self._auto_unload_loop())
+        logger.info(
+            f"[ONNXEmbedding] 已启动自动卸载任务，超时时间: {self.auto_unload_timeout} 分钟"
+        )
+
+    async def _auto_unload_loop(self):
+        check_interval = min(60, self.auto_unload_timeout * 60 / 2)
+        check_interval = max(10, check_interval)
+
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.sleep(check_interval)
+
+                if self.session is None:
+                    continue
+
+                elapsed = time.time() - self._last_used_time
+                timeout_seconds = self.auto_unload_timeout * 60
+
+                if elapsed >= timeout_seconds:
+                    logger.info(
+                        f"[ONNXEmbedding] 模型已 {self.auto_unload_timeout} 分钟未使用，自动卸载"
+                    )
+                    async with self._model_lock:
+                        if self.session is not None:
+                            self._cleanup_resources()
+                            logger.info("[ONNXEmbedding] 模型已自动卸载")
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"[ONNXEmbedding] 自动卸载检查出错: {e}")
+
+    def _stop_auto_unload_task(self):
+        if self._auto_unload_task is not None:
+            self._shutdown_event.set()
+            if not self._auto_unload_task.done():
+                self._auto_unload_task.cancel()
+            self._auto_unload_task = None
+
     # ====================================================
     # Embedding API
     # ====================================================
 
     async def get_embedding(self, text: str) -> list[float]:
-        """获取单个文本的嵌入向量"""
         await self._ensure_model_loaded()
+        self._update_last_used_time()
 
         loop = asyncio.get_running_loop()
         embedding = await loop.run_in_executor(None, self._encode, [text])
         return embedding[0].tolist()
 
     async def get_embeddings(self, texts: list[str]) -> list[list[float]]:
-        """批量获取文本的嵌入向量"""
         await self._ensure_model_loaded()
+        self._update_last_used_time()
 
         loop = asyncio.get_running_loop()
         embeddings = await loop.run_in_executor(None, self._encode, texts)
         return embeddings.tolist()
 
     def _encode(self, texts: list[str]) -> np.ndarray:
-        """
-        对文本列表进行编码，返回numpy数组
-
-        支持两种常见的ONNX模型输出格式：
-        1. 直接输出sentence_embedding (key: "sentence_embedding")
-        2. 输出last_hidden_state，需要mean pooling (key: "last_hidden_state")
-        """
         if self.tokenizer is None or self.session is None:
             raise RuntimeError("模型未加载")
 
-        # Tokenize
         encoding = self.tokenizer.encode_batch(texts)
         input_ids = np.array([e.ids for e in encoding], dtype=np.int64)
         attention_mask = np.array([e.attention_mask for e in encoding], dtype=np.int64)
 
-        # 获取输入名称
-        input_names = [inp.name for inp in self.session.get_inputs()]
+        backend, model = self.session
+
+        if backend == "openvino":
+            return self._encode_openvino(model, input_ids, attention_mask)
+        else:
+            return self._encode_onnxruntime(model, input_ids, attention_mask)
+
+    def _encode_openvino(
+        self, model, input_ids: np.ndarray, attention_mask: np.ndarray
+    ) -> np.ndarray:
+        import openvino as ov
+
+        input_names = [inp.any_name for inp in model.inputs()]
         feed_dict = {}
 
-        # 根据模型输入构建feed字典
+        if "input_ids" in input_names:
+            feed_dict["input_ids"] = ov.Tensor(input_ids)
+        if "attention_mask" in input_names:
+            feed_dict["attention_mask"] = ov.Tensor(attention_mask)
+        if "token_type_ids" in input_names:
+            feed_dict["token_type_ids"] = ov.Tensor(np.zeros_like(input_ids))
+
+        infer_request = model.create_infer_request()
+        infer_request.infer(feed_dict)
+
+        output_names = [out.any_name for out in model.outputs()]
+
+        if "sentence_embedding" in output_names:
+            embeddings = infer_request.get_tensor("sentence_embedding").data[:]
+        elif "last_hidden_state" in output_names:
+            last_hidden_state = infer_request.get_tensor("last_hidden_state").data[:]
+            embeddings = _mean_pooling(last_hidden_state, attention_mask)
+            embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
+        else:
+            embeddings = list(infer_request.results.values())[0].data[:]
+            if len(embeddings.shape) == 3:
+                embeddings = _mean_pooling(embeddings, attention_mask)
+                embeddings = embeddings / np.linalg.norm(
+                    embeddings, axis=1, keepdims=True
+                )
+
+        return embeddings
+
+    def _encode_onnxruntime(
+        self, session, input_ids: np.ndarray, attention_mask: np.ndarray
+    ) -> np.ndarray:
+        input_names = [inp.name for inp in session.get_inputs()]
+        feed_dict = {}
+
         if "input_ids" in input_names:
             feed_dict["input_ids"] = input_ids
         if "attention_mask" in input_names:
             feed_dict["attention_mask"] = attention_mask
-
-        # 某些模型可能需要token_type_ids
         if "token_type_ids" in input_names:
             feed_dict["token_type_ids"] = np.zeros_like(input_ids)
 
-        # 运行推理
-        outputs = self.session.run(None, feed_dict)
-        output_names = [out.name for out in self.session.get_outputs()]
+        outputs = session.run(None, feed_dict)
+        output_names = [out.name for out in session.get_outputs()]
 
-        # 处理输出
         if "sentence_embedding" in output_names:
-            # 直接返回sentence embedding
             idx = output_names.index("sentence_embedding")
             embeddings = outputs[idx]
         elif "last_hidden_state" in output_names:
-            # 需要mean pooling
             idx = output_names.index("last_hidden_state")
             last_hidden_state = outputs[idx]
             embeddings = _mean_pooling(last_hidden_state, attention_mask)
-            # L2归一化
             embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
         else:
-            # 默认返回第一个输出
             embeddings = outputs[0]
-            # 如果是3D (batch, seq_len, hidden_dim)，进行mean pooling
             if len(embeddings.shape) == 3:
                 embeddings = _mean_pooling(embeddings, attention_mask)
                 embeddings = embeddings / np.linalg.norm(
@@ -488,6 +587,7 @@ class ONNXEmbeddingProvider(EmbeddingProvider):
     # ====================================================
 
     async def unload_model(self) -> bool:
+        self._stop_auto_unload_task()
         async with self._model_lock:
             if self.session is None:
                 logger.info("[ONNXEmbedding] 模型未加载，无需卸载")
@@ -497,6 +597,7 @@ class ONNXEmbeddingProvider(EmbeddingProvider):
             return await loop.run_in_executor(None, self._cleanup_resources)
 
     def force_unload_sync(self) -> bool:
+        self._stop_auto_unload_task()
         if self.session is None:
             return True
         return self._cleanup_resources()
@@ -543,61 +644,12 @@ class ONNXEmbedding(Star):
                 "type": "ONNXEmbedding",
                 "provider": "Local",
                 "ONNXEmbedding_path": DEFAULT_MODEL_NAME,
-                "ONNXEmbedding_tokenizer_path": "",
-                "ONNXEmbedding_optimization_level": "disable",
-                "ONNXEmbedding_max_length": 256,
-                "huggingface_mirror": "",
-                "auto_download": 1,
                 "provider_type": "embedding",
                 "enable": True,
                 "embedding_dimensions": 384,
             }
         except KeyError:
             logger.error("[ONNXEmbedding] AstrBot 配置结构异常，无法注册 Provider")
-            return False
-
-        try:
-            CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"][
-                "ONNXEmbedding_path"
-            ] = {
-                "description": "ONNX 模型路径（目录或.onnx文件）",
-                "type": "string",
-            }
-            CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"][
-                "ONNXEmbedding_tokenizer_path"
-            ] = {
-                "description": "Tokenizer 文件路径（可选，默认从模型目录查找）",
-                "type": "string",
-            }
-            CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"][
-                "ONNXEmbedding_optimization_level"
-            ] = {
-                "description": "ONNX Runtime 图优化级别（disable/basic/extended/all），默认disable避免兼容性问题",
-                "type": "string",
-            }
-            CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"][
-                "ONNXEmbedding_max_length"
-            ] = {
-                "description": "最大序列长度（默认256），超过会被截断",
-                "type": "int",
-            }
-            CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"][
-                "huggingface_mirror"
-            ] = {
-                "description": "HuggingFace 镜像地址（留空使用官方源，如：https://hf-mirror.com）",
-                "type": "string",
-            }
-            CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"][
-                "auto_download"
-            ] = {
-                "description": "模型文件不存在时是否自动从 HuggingFace 下载（0=否，1=是）",
-                "type": "int",
-            }
-        except KeyError:
-            logger.error("[ONNXEmbedding] AstrBot 配置结构异常，无法注册 Provider")
-            CONFIG_METADATA_2["provider_group"]["metadata"]["provider"][
-                "config_template"
-            ].pop("ONNXEmbedding", None)
             return False
 
         # ---- Provider 注册 ----
@@ -629,30 +681,8 @@ class ONNXEmbedding(Star):
                     "type": "ONNXRerank",
                     "provider": "Local",
                     "ONNXRerank_path": "BAAI/bge-reranker-base",
-                    "ONNXRerank_tokenizer_path": "",
-                    "ONNXRerank_max_length": 512,
-                    "huggingface_mirror": "",
-                    "auto_download": 1,
                     "provider_type": "rerank",
                     "enable": True,
-                }
-                CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"][
-                    "ONNXRerank_path"
-                ] = {
-                    "description": "ONNX Rerank 模型路径（目录或.onnx文件）",
-                    "type": "string",
-                }
-                CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"][
-                    "ONNXRerank_tokenizer_path"
-                ] = {
-                    "description": "Tokenizer 文件路径（可选，默认从模型目录查找）",
-                    "type": "string",
-                }
-                CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"][
-                    "ONNXRerank_max_length"
-                ] = {
-                    "description": "最大序列长度（默认512）",
-                    "type": "int",
                 }
             except KeyError:
                 logger.warning("[ONNXRerank] 无法注册 Rerank Provider 配置")
@@ -669,21 +699,6 @@ class ONNXEmbedding(Star):
             CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"].pop(
                 "ONNXEmbedding_path", None
             )
-            CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"].pop(
-                "ONNXEmbedding_tokenizer_path", None
-            )
-            CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"].pop(
-                "ONNXEmbedding_optimization_level", None
-            )
-            CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"].pop(
-                "ONNXEmbedding_max_length", None
-            )
-            CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"].pop(
-                "huggingface_mirror", None
-            )
-            CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"].pop(
-                "auto_download", None
-            )
         except KeyError:
             pass
 
@@ -694,12 +709,6 @@ class ONNXEmbedding(Star):
             CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"].pop(
                 "ONNXRerank_path", None
             )
-            CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"].pop(
-                "ONNXRerank_tokenizer_path", None
-            )
-            CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"].pop(
-                "ONNXRerank_max_length", None
-            )
         except KeyError:
             pass
 
@@ -709,71 +718,13 @@ class ONNXEmbedding(Star):
     # --------------------------------------------------------
     # Commands
     # --------------------------------------------------------
-    @filter.command_group("onnx")
-    def onnx(self):
-        pass
-
-    @onnx.command("help")
-    async def help_cmd(self, event: AstrMessageEvent):
-        help_text = [
-            "ONNXEmbedding 插件 - 基于ONNX Runtime的轻量级嵌入向量生成插件",
-            "/onnx register                      注册 Provider",
-            "/onnx redb                          重新加载数据库",
-            "/onnx kbinfo                        获取所有数据库以及其对应的embedding_provider_id",
-            "/onnx unload [embedding_provider_id] 卸载指定Provider的权重",
-            "/onnx query <知识库名> <查询内容>     直接查询向量数据库，返回前2条结果",
-        ]
-        yield event.plain_result("\n".join(help_text))
-
-    @onnx.command("redb")
-    async def redb(self, event: AstrMessageEvent):
-        """重新加载数据库，防止在astrbot初始化后出现ONNXEmbeddingProvider未注册数据库加载失败的情况"""
-        await self.context.kb_manager.load_kbs()
-        yield event.plain_result("[ONNXEmbedding] 数据库已重新加载")
-
-    @onnx.command("register")
-    async def register_cmd(self, event: AstrMessageEvent):
-        """主动将ONNXEmbedding注册到嵌入式向量提供商"""
-        yield event.plain_result("[ONNXEmbedding] 正在注册 Provider")
-        if self._register_config():
-            yield event.plain_result("[ONNXEmbedding] 注册 Provider 成功")
-        await self.context.kb_manager.load_kbs()
-
-    @onnx.command("kbinfo")
-    async def get_kb_name_epid(self, event: AstrMessageEvent):
-        """获取所有数据库以及其对应的编码器"""
-        outputtext = []
-        for kb_helper in self.context.kb_manager.kb_insts.values():
-            outputtext.append(
-                f"数据库名称:{kb_helper.kb.kb_name}, 编码器:{kb_helper.kb.embedding_provider_id}"
-            )
-        yield event.plain_result(f"可用数据库:\n" + "\n".join(outputtext))
-        logger.info(f"[ONNXEmbedding] 可用数据库:\n" + "\n".join(outputtext))
-
-    @onnx.command("unload")
-    async def unload_kbw(self, event: AstrMessageEvent, embedding_provider_id: str):
-        pm = self.context.provider_manager.get_provider_by_id(embedding_provider_id)
-        if isinstance(pm, ONNXEmbeddingProvider):
-            yield event.plain_result(f"[ONNXEmbedding] 正在清理权重")
-            logger.info(f"[ONNXEmbedding] 正在清理权重")
-            await pm.unload_model()
-            yield event.plain_result(f"[ONNXEmbedding] 清理权重成功")
-            logger.info(f"[ONNXEmbedding] 清理权重成功")
-        else:
-            yield event.plain_result(
-                f"[ONNXEmbedding] 编码器实例:{embedding_provider_id},不为ONNXEmbeddingProvider"
-            )
-            logger.info(
-                f"[ONNXEmbedding] 编码器实例:{embedding_provider_id},不为ONNXEmbeddingProvider"
-            )
-
-    @onnx.command("query")
+    @filter.command("onnx")
     async def query_kb(
         self, event: AstrMessageEvent, kb_name: str, query_text: GreedyStr = ""
     ):
         if not query_text:
             yield event.plain_result(
-                "[ONNXEmbedding] 用法: /onnx query <知识库名> <查询内容>"
+                "[ONNXEmbedding] 用法: /onnx <知识库名> <查询内容>"
             )
             return
 
@@ -782,8 +733,6 @@ class ONNXEmbedding(Star):
         if not kb_helper:
             yield event.plain_result(f"[ONNXEmbedding] 未找到知识库: {kb_name}")
             return
-
-        yield event.plain_result(f"[ONNXEmbedding] 正在查询知识库 '{kb_name}'...")
 
         try:
             results = await kb_manager.retrieve(

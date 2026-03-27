@@ -1,17 +1,17 @@
 # ONNXEmbedding - AstrBot ONNX 嵌入向量生成插件
 
-一个为 [AstrBot](https://github.com/AstrBotDevs/astrbot) 框架设计的 **ONNX Runtime** 嵌入向量生成和文本对话插件，相比传统的 PyTorch 方案具有更低的配置要求和更快的推理速度。
+一个为 [AstrBot](https://github.com/AstrBotDevs/astrbot) 框架设计的 **ONNX Runtime / OpenVINO** 嵌入向量生成和重排序插件，相比传统的 PyTorch 方案具有更低的配置要求和更快的推理速度。
 
 ## 功能特性
 
-- 🚀 **ONNX Runtime 加速**: 使用 ONNX Runtime 推理引擎，无需 PyTorch，配置要求更低
-- 🤖 **文本对话支持**: 支持 ONNX 文本生成模型（Chat Provider）
+- 🚀 **多后端支持**: 支持 ONNX Runtime 和 OpenVINO 两种推理后端
+- 🖥️ **硬件加速**: 支持 CPU、NVIDIA GPU (CUDA)、AMD GPU (ROCm)、Intel GPU (OpenVINO)、DirectML
 - 📦 **嵌入向量生成**: 支持 ONNX Embedding 模型
+- 🔄 **重排序支持**: 内置 ONNX Rerank Provider，支持知识库检索重排序
 - 📦 **轻量级部署**: 相比 PyTorch 版本，内存占用和磁盘空间需求大幅减少
 - 🔧 **无缝集成**: 作为 AstrBot 的 Provider 适配器，可直接在框架配置中使用
-- 📦 **自动配置注册**: 插件启动时自动注册配置项到 AstrBot 全局配置
-- 🧹 **资源清理**: 插件卸载时自动清理注册的配置和适配器
-- 🔌 **即插即用**: 简单的安装和配置流程
+- 🌐 **HuggingFace 镜像**: 支持配置 HuggingFace 镜像地址，加速模型下载
+- ⏱️ **自动卸载**: 支持配置模型自动卸载超时时间，节省内存
 
 ## 安装要求
 
@@ -22,339 +22,186 @@
 
 ### Python 依赖
 
-```bash
-pip install -r requirements.txt
-```
-
-或手动安装：
+基础依赖（必需）：
 
 ```bash
 pip install onnxruntime tokenizers numpy
 ```
 
-插件会自动检查依赖，如果缺少必要的库，会在初始化时提示安装。
-
-## 配置说明
-
-### 自动注册的配置项
-
-插件初始化时会自动向 AstrBot 注册以下配置：
-
-```json
-{
-  "provider_group": {
-    "metadata": {
-      "provider": {
-        "config_template": {
-          "ONNXEmbedding": {
-            "id": "ONNXEmbedding",
-            "type": "ONNXEmbedding",
-            "provider": "Local",
-            "ONNXEmbedding_path": "./all-MiniLM-L6-v2/",
-            "ONNXEmbedding_tokenizer_path": "",
-            "provider_type": "embedding",
-            "enable": true,
-            "embedding_dimensions": 384
-          }
-        },
-        "items": {
-          "ONNXEmbedding_path": {
-            "description": "ONNX 模型路径（目录或.onnx文件）",
-            "type": "string"
-          },
-          "ONNXEmbedding_tokenizer_path": {
-            "description": "Tokenizer 文件路径（可选，默认从模型目录查找）",
-            "type": "string"
-          }
-        }
-      }
-    }
-  }
-}
-```
-
-### 配置参数详解
-
-| 参数名 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `ONNXEmbedding_path` | string | `"all-MiniLM-L6-v2"` | ONNX 模型路径，支持相对路径和绝对路径，可以是目录或.onnx文件 |
-| `ONNXEmbedding_tokenizer_path` | string | `""` | Tokenizer 文件路径，可选，默认从模型目录自动查找 |
-| `ONNXEmbedding_optimization_level` | string | `"disable"` | 图优化级别：`disable`/`basic`/`extended`/`all`，默认禁用以避免兼容性问题 |
-| `ONNXEmbedding_max_length` | int | `256` | 最大序列长度，超过会被截断 |
-| `embedding_dimensions` | integer | `384` | 嵌入向量的维度 |
-| `enable` | boolean | `true` | 是否启用该 provider |
-| `provider_type` | string | `"embedding"` | Provider 类型 |
-
-### 路径说明
-
-- **相对路径**: 相对于 AstrBot 的 `data_dir` 目录
-- **绝对路径**: 直接使用指定的完整路径
-
-## 使用方法
-
-### 1. 作为嵌入向量提供者
-
-可以在插件配置里面选择开机自启，第一次需要用户手动操作启动。使用指令 `/onnx register` 将提供商注册到嵌入向量提供者，然后可以通过嵌入式模型的创建页面创建这个嵌入向量提供者。
-
-### 2. 作为文本对话提供者（Chat Provider）
-
-插件同时支持 ONNX 文本生成模型作为聊天对话提供者：
-
-1. 在 AstrBot 的 Provider Source 中添加 `ONNXChat` 类型
-2. 配置 `ONNXChat_model_path` 指向 ONNX 模型目录
-3. 配置生成参数（temperature、max_new_tokens 等）
-4. 在 Provider 设置中选择创建的 ONNXChat Provider
-
-### 3. 插件命令
-
-使用 `/onnx help` 获取帮助：
-
-- `/onnx register` - 注册 Provider
-- `/onnx redb` - 重新加载数据库
-- `/onnx kbinfo` - 获取所有数据库以及其对应的 embedding_provider_id
-- `/onnx unload [embedding_provider_id]` - 卸载指定 Provider 的权重
-
-## ONNX Chat Provider 配置
-
-### Chat Provider 专属配置参数
-
-| 参数名 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `ONNXChat_model_path` | string | `""` | ONNX 聊天模型路径（必填） |
-| `ONNXChat_tokenizer_path` | string | `""` | Tokenizer 路径（可选） |
-| `ONNXChat_model_name` | string | `"onnx-chat-model"` | 模型显示名称 |
-| `ONNXChat_max_length` | int | `512` | 最大输入序列长度 |
-| `ONNXChat_max_new_tokens` | int | `128` | 最大生成token数 |
-| `ONNXChat_temperature` | float | `0.8` | 采样温度（0-2） |
-| `ONNXChat_top_p` | float | `0.9` | Top-p 采样（0-1） |
-| `ONNXChat_top_k` | int | `50` | Top-k 采样 |
-
-### 推荐的 ONNX 聊天模型
-
-| 模型 | 大小 | 说明 |
-|------|------|------|
-| `gpt2` (ONNX) | ~500MB | OpenAI GPT-2 基础版 |
-| `TinyLlama-1.1B` (ONNX) | ~2GB | 轻量级 Llama 模型 |
-| `opt-125m` (ONNX) | ~250MB | Meta OPT 125M |
-
-**注意**: 需要将 PyTorch 模型转换为 ONNX 格式才能使用。可以使用以下命令转换：
+GPU 加速（可选）：
 
 ```bash
-pip install optimum[exporters]
-optimum-cli export onnx --model gpt2 ./gpt2-onnx/
-```
-
-## 模型支持
-
-### 预训练模型
-
-插件默认使用 `all-MiniLM-L6-v2` 模型（384维）。
-
-### 如何获取 ONNX 模型
-
-#### 方法 1：使用下载脚本（推荐）
-
-插件提供了便捷的下载脚本：
-
-```bash
-# 下载默认模型 (Xenova/all-MiniLM-L6-v2)
-python download_model.py
-
-# 下载其他模型
-python download_model.py --model Xenova/all-MiniLM-L6-v2
-
-# 指定输出目录
-python download_model.py --output /path/to/models
-```
-
-#### 方法 2：从 Hugging Face 手动下载
-
-1. **使用 huggingface-cli**（需要安装 huggingface_hub）：
-   ```bash
-   pip install huggingface-hub
-   
-   # 下载模型
-   huggingface-cli download Xenova/all-MiniLM-L6-v2 --local-dir ./models/all-MiniLM-L6-v2
-   ```
-
-2. **使用 git-lfs**（需要安装 git-lfs）：
-   ```bash
-   git lfs install
-   git clone https://huggingface.co/Xenova/all-MiniLM-L6-v2 ./models/all-MiniLM-L6-v2
-   ```
-
-3. **手动下载文件**：
-   访问 [Hugging Face 模型页面](https://huggingface.co/Xenova/all-MiniLM-L6-v2/tree/main)，下载以下文件：
-   - `onnx/model.onnx` → 重命名为 `model.onnx`
-   - `tokenizer.json`
-   - `config.json`
-   - `tokenizer_config.json`
-
-#### 方法 3：手动转换 PyTorch 模型
-
-使用 `optimum` 库将 PyTorch 模型转换为 ONNX 格式：
-```bash
-pip install optimum[exporters]
-optimum-cli export onnx --model sentence-transformers/all-MiniLM-L6-v2 ./onnx-model/
-```
-
-### 模型目录结构
-
-ONNX 模型目录应包含以下文件：
-
-```
-model_dir/
-├── model.onnx          # ONNX 模型文件
-└── tokenizer.json      # Tokenizer 配置文件
-```
-
-### 推荐模型
-
-以下模型已经过测试，可直接使用：
-
-| 模型 | 语言 | 维度 | 大小 | 说明 |
-|------|------|------|------|------|
-| `Xenova/all-MiniLM-L6-v2` | 英语 | 384 | ~80MB | ⭐ 推荐，ONNX 专用优化版本 |
-| `Xenova/paraphrase-multilingual-MiniLM-L12-v2` | 多语言 | 384 | ~120MB | ⭐ 推荐，多语言支持 |
-| `sentence-transformers/all-MiniLM-L6-v2` | 英语 | 384 | ~80MB | 原版模型（需手动转换） |
-
-**推荐使用 Xenova 组织的模型**，这些模型专为 ONNX Runtime 优化，下载即可使用。
-
-## 性能对比
-
-| 特性 | Sentence Transformers (PyTorch) | ONNX Runtime |
-|------|----------------------------------|--------------|
-| 依赖大小 | ~500MB+ | ~100MB |
-| 内存占用 | 较高 | 较低 |
-| 推理速度 | 快 | 更快 |
-| GPU 支持 | CUDA | CUDA/DirectML/ROCm |
-| 配置复杂度 | 高 | 低 |
-
-## 开发说明
-
-### 生命周期方法
-
-- `initialize()`: 插件启动时调用，注册配置和适配器
-- `terminate()`: 插件停止时调用，清理配置和适配器
-
-### 日志
-
-插件使用 AstrBot 的日志系统，日志前缀为 `[ONNXEmbedding]`。
-
-## 故障排除
-
-### 常见问题
-
-#### 1. 导入错误：缺少 onnxruntime
-
-```bash
-# 安装依赖
-pip install onnxruntime
-```
-
-对于 GPU 支持：
-```bash
-# CUDA
+# NVIDIA CUDA
 pip install onnxruntime-gpu
 
 # DirectML (Windows)
 pip install onnxruntime-directml
 ```
 
-#### 2. 模型加载失败
+OpenVINO 后端（可选，推荐 Intel GPU 用户使用）：
 
-- 检查模型路径是否正确
-- 确认 model.onnx 文件存在且完整
-- 检查 tokenizer.json 是否存在
+```bash
+pip install openvino
+```
 
-#### 3. 图优化错误（Attempting to get index by a name which does not exist）
+## 配置说明
 
-如果遇到类似 `Attempting to get index by a name which does not exist: InsertedPrecisionFreeCast_...` 的错误，说明模型文件可能损坏或与当前 ONNX Runtime 版本不兼容。
+### 插件级配置
 
-**解决方案（按优先级）：**
+在插件配置页面可以设置：
 
-1. **重新下载模型（推荐）：**
-   ```bash
-   # 删除旧模型
-   rm -rf ./models/all-MiniLM-L6-v2
-   
-   # 重新下载
-   python download_model.py --model Xenova/all-MiniLM-L6-v2
-   ```
+| 配置项 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `auto_start` | int | 0 | 是否开机自动注册 Provider |
+| `huggingface_mirror` | string | "" | HuggingFace 镜像地址（如：https://hf-mirror.com） |
+| `auto_download` | int | 1 | 模型不存在时是否自动下载 |
+| `auto_unload_timeout` | int | 0 | 模型自动卸载超时时间（分钟，0 表示禁用） |
 
-2. **检查模型完整性：**
-   确保 `model.onnx` 文件大小正确（约 80-120MB），如果文件过小可能下载不完整。
+### Provider 配置
 
-3. **尝试其他模型源：**
-   ```bash
-   # 使用 onnx-community 的版本
-   python download_model.py --model onnx-community/all-MiniLM-L6-v2-ONNX
-   
-   # 或使用 onnx-models 的版本
-   python download_model.py --model onnx-models/all-MiniLM-L6-v2-onnx
-   ```
+创建 Embedding Provider 时：
 
-4. **手动转换模型：**
-   如果预转换的模型都有问题，可以使用 optimum 自己转换：
-   ```bash
-   pip install optimum[exporters]
-   optimum-cli export onnx --model sentence-transformers/all-MiniLM-L6-v2 ./my-model/
-   ```
+| 参数名 | 默认值 | 说明 |
+|--------|--------|------|
+| `ONNXEmbedding_path` | `sentence-transformers/all-MiniLM-L6-v2` | 模型路径，支持 HuggingFace 模型名或本地路径 |
+| `embedding_dimensions` | 384 | 嵌入向量维度 |
 
-5. **检查 ONNX Runtime 版本：**
-   ```bash
-   pip show onnxruntime
-   # 建议升级到最新版本
-   pip install -U onnxruntime
-   ```
+创建 Rerank Provider 时：
 
-#### 4. 配置未注册
+| 参数名 | 默认值 | 说明 |
+|--------|--------|------|
+| `ONNXRerank_path` | `BAAI/bge-reranker-base` | Rerank 模型路径 |
+| `ONNXRerank_max_length` | 512 | 最大序列长度 |
 
-- 确认插件已正确加载
-- 检查插件初始化日志
-- 重启 AstrBot
+## 使用方法
 
-#### 5. Tokenizer 未找到
+### 1. 创建 Embedding Provider
 
-- 确保模型目录包含 `tokenizer.json` 文件
-- 或在配置中显式指定 `ONNXEmbedding_tokenizer_path`
+1. 在 AstrBot 管理面板 → Provider → 嵌入(Embedding) → 新增
+2. 选择类型 `ONNXEmbedding`
+3. 配置模型路径（支持 HuggingFace 模型名，如 `sentence-transformers/all-MiniLM-L6-v2`）
+4. 设置嵌入维度（根据模型调整）
 
-#### 6. 形状不匹配错误（inhomogeneous shape）
+### 2. 创建 Rerank Provider
 
-如果遇到 `setting an array element with a sequence. The requested array has an inhomogeneous shape` 错误，说明输入序列长度不一致。
+1. 在知识库设置中选择 Rerank Provider
+2. 选择类型 `ONNXRerank`
+3. 配置模型路径（推荐 `BAAI/bge-reranker-base`）
 
-**原因：** Tokenizer 没有正确配置 padding，导致不同长度的输入无法组成 batch。
+### 3. 直接查询命令
 
-**解决方案：**
-- 确保使用最新版本的插件代码（已修复）
-- 在配置中设置 `ONNXEmbedding_max_length`（默认 256）：
-  ```json
-  {
-    "ONNXEmbedding_max_length": 256
-  }
-  ```
-- 如果问题仍然存在，尝试降低 `max_length` 到 128 或 512
+```
+/onnx <知识库名> <查询内容>
+```
+
+示例：
+```
+/onnx 我的知识库 如何配置插件
+```
+
+返回知识库中最相关的 2 条结果。
+
+## 后端选择
+
+插件支持两种推理后端：
+
+### ONNX Runtime（默认）
+
+- 通用性好，支持多种硬件
+- 自动检测可用的 Execution Provider（CUDA、DirectML、CPU 等）
+
+### OpenVINO
+
+- Intel 硬件优化，特别是 Intel iGPU
+- 安装 OpenVINO 后自动启用
+- 自动检测可用设备（GPU/CPU）
+
+当 OpenVINO 已安装时，插件会优先尝试使用 OpenVINO 后端；如果失败则回退到 ONNX Runtime。
+
+## 推荐模型
+
+### Embedding 模型
+
+| 模型 | 语言 | 维度 | 大小 | 说明 |
+|------|------|------|------|------|
+| `sentence-transformers/all-MiniLM-L6-v2` | 英语 | 384 | ~80MB | 推荐，快速高效 |
+| `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` | 多语言 | 384 | ~120MB | 多语言支持 |
+| `BAAI/bge-small-zh-v1.5` | 中文 | 512 | ~100MB | 中文优化 |
+
+### Rerank 模型
+
+| 模型 | 语言 | 大小 | 说明 |
+|------|------|------|------|
+| `BAAI/bge-reranker-base` | 多语言 | ~1GB | 推荐，效果好 |
+| `BAAI/bge-reranker-large` | 多语言 | ~3GB | 更高精度 |
+| `cross-encoder/ms-marco-MiniLM-L-6-v2` | 英语 | ~80MB | 英文专用 |
+
+## HuggingFace 镜像配置
+
+国内用户可配置镜像加速下载：
+
+```json
+{
+  "huggingface_mirror": "https://hf-mirror.com"
+}
+```
+
+常用镜像：
+- https://hf-mirror.com
+- https://huggingface.co（官方源）
+
+## 故障排除
+
+### 1. 缺少依赖
+
+```bash
+# 基础依赖
+pip install onnxruntime tokenizers numpy
+
+# OpenVINO（可选）
+pip install openvino
+```
+
+### 2. Intel GPU 加速
+
+如果使用 Intel iGPU，推荐安装 OpenVINO：
+
+```bash
+pip install openvino
+```
+
+### 3. 模型下载失败
+
+- 检查网络连接
+- 配置 HuggingFace 镜像地址
+- 手动下载模型文件
+
+### 4. 内存不足
+
+- 设置 `auto_unload_timeout` 自动卸载长时间未使用的模型
+- 选择更小的模型
 
 ## 版本历史
 
-### v1.1.0
+### v2.0.0
 
-- 新增 ONNX Chat Provider，支持文本对话功能
-- 支持自回归文本生成（GPT 类模型）
-- 支持流式输出
-- 可配置的生成参数（temperature、top_p、top_k）
-- 优化模型加载逻辑
+- 新增 OpenVINO 后端支持，优化 Intel GPU 性能
+- 新增 ONNX Rerank Provider
+- 新增 `/onnx` 命令直接查询知识库
+- 新增 HuggingFace 镜像配置
+- 新增模型自动卸载功能
+- 简化配置项，移除冗余参数
+- 移除 Chat Provider（建议使用专门的对话模型）
 
 ### v1.0.0
 
 - 初始版本发布
 - 支持 ONNX Runtime 推理
-- 自动配置注册和清理
-- 提供基本的嵌入向量生成功能
+- 基本的嵌入向量生成功能
 
 ## 致谢
 
-- [ONNX Runtime](https://onnxruntime.ai/) - 用于高性能推理
-- [Hugging Face Tokenizers](https://huggingface.co/docs/tokenizers/) - 用于文本分词
-- [Sentence Transformers](https://www.sbert.net/) - 提供原始模型架构
-- [AstrBot](https://github.com/AstrBotDevs/AstrBot) - 提供插件框架
+- [ONNX Runtime](https://onnxruntime.ai/) - 高性能推理引擎
+- [OpenVINO](https://docs.openvino.ai/) - Intel 优化推理引擎
+- [Hugging Face](https://huggingface.co/) - 模型托管平台
+- [AstrBot](https://github.com/AstrBotDevs/AstrBot) - 插件框架

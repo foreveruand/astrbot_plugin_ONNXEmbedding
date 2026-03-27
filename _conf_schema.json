@@ -17,5 +17,10 @@
     "enum": [0, 1],
     "enum_descriptions": ["否", "是"],
     "default": 1
+  },
+  "auto_unload_timeout": {
+    "description": "模型自动卸载超时时间（分钟，0表示禁用自动卸载）",
+    "type": "int",
+    "default": 0
   }
 }
