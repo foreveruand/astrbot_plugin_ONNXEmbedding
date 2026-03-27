@@ -5,5 +5,17 @@
     "enum": [0, 1],
     "enum_descriptions": ["否", "是"],
     "default": 0
+  },
+  "huggingface_mirror": {
+    "description": "HuggingFace 镜像地址（留空使用官方源）",
+    "type": "string",
+    "default": ""
+  },
+  "auto_download": {
+    "description": "模型文件不存在时是否自动从 HuggingFace 下载",
+    "type": "int",
+    "enum": [0, 1],
+    "enum_descriptions": ["否", "是"],
+    "default": 1
   }
 }

@@ -5,8 +5,10 @@ ONNX Embedding Provider for AstrBot
 
 import asyncio
 import gc
+import sys
 from pathlib import Path
 from typing import Any
+from urllib.request import urlretrieve
 
 import numpy as np
 from astrbot.api import AstrBotConfig, logger
@@ -25,6 +27,77 @@ from .provider_chat import ONNXChatProvider, register_ONNXChatProvider
 
 DEFAULT_MODEL_NAME = "all-MiniLM-L6-v2"
 DEFAULT_ONNX_URL = "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx"
+DEFAULT_HUGGINGFACE_MIRROR = ""  # 留空使用官方源
+
+
+# ============================================================
+# 模型下载工具函数
+# ============================================================
+def _download_file(url: str, output_path: Path, desc: str = ""):
+    """下载文件并显示进度"""
+
+    def progress_hook(count, block_size, total_size):
+        if total_size > 0:
+            percent = int(count * block_size * 100 / total_size)
+            sys.stdout.write(f"\r{desc}: {percent}%")
+            sys.stdout.flush()
+
+    logger.info(f"[ONNXEmbedding] 正在下载 {desc}...")
+    urlretrieve(url, output_path, reporthook=progress_hook)
+    logger.info(f"[ONNXEmbedding] ✓ {desc} 下载完成: {output_path}")
+
+
+def _download_model_from_hf(
+    model_name: str,
+    output_dir: Path,
+    hf_mirror: str = "",
+) -> Path:
+    """
+    从 Hugging Face 下载 ONNX 模型
+
+    Args:
+        model_name: Hugging Face 模型名称（如 Xenova/all-MiniLM-L6-v2）
+        output_dir: 输出目录
+        hf_mirror: HuggingFace 镜像地址（留空使用官方源）
+
+    Returns:
+        模型目录路径
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    base_url = hf_mirror.rstrip("/") if hf_mirror else "https://huggingface.co"
+    base_url = f"{base_url}/{model_name}/resolve/main"
+
+    files_to_download = {
+        "onnx/model.onnx": "ONNX 模型文件",
+        "tokenizer.json": "Tokenizer",
+        "config.json": "配置文件",
+        "tokenizer_config.json": "Tokenizer 配置",
+        "special_tokens_map.json": "特殊 token 映射",
+        "vocab.txt": "词表文件",
+    }
+
+    logger.info(f"[ONNXEmbedding] 正在下载模型: {model_name}")
+    logger.info(f"[ONNXEmbedding] 输出目录: {output_dir}")
+
+    for filename, desc in files_to_download.items():
+        output_path = output_dir / filename.replace("onnx/", "")
+
+        if output_path.exists():
+            logger.info(f"[ONNXEmbedding] ✓ {desc} 已存在，跳过: {output_path}")
+            continue
+
+        url = f"{base_url}/{filename}"
+
+        try:
+            _download_file(url, output_path, desc)
+        except Exception as e:
+            logger.warning(f"[ONNXEmbedding] ✗ {desc} 下载失败: {e}")
+            continue
+
+    logger.info(f"[ONNXEmbedding] ✅ 模型下载完成！模型路径: {output_dir}")
+    return output_dir
 
 
 def _mean_pooling(
@@ -50,6 +123,12 @@ class ONNXEmbeddingProvider(EmbeddingProvider):
 
     def __init__(self, provider_config: dict, provider_settings: dict) -> None:
         super().__init__(provider_config, provider_settings)
+
+        # -------- 下载相关配置 --------
+        self.hf_mirror = provider_config.get(
+            "huggingface_mirror", DEFAULT_HUGGINGFACE_MIRROR
+        )
+        self.auto_download = provider_config.get("auto_download", 1) == 1
 
         # -------- 模型路径处理（Pathlib）--------
         base_path = provider_config.get("ONNXEmbedding_path", DEFAULT_MODEL_NAME)
@@ -239,9 +318,6 @@ class ONNXEmbeddingProvider(EmbeddingProvider):
             )
 
     async def _ensure_model_loaded(self):
-        """
-        Lazy Loading + 并发安全
-        """
         self._ensure_env_available()
 
         if self.session is not None and self.tokenizer is not None:
@@ -251,17 +327,64 @@ class ONNXEmbeddingProvider(EmbeddingProvider):
             if self.session is not None and self.tokenizer is not None:
                 return
 
+            await self._download_model_if_needed()
+
             logger.info(f"[ONNXEmbedding] 开始加载模型: {self.model_path}")
             loop = asyncio.get_running_loop()
 
             try:
-                # 加载tokenizer和session
                 self.tokenizer = await loop.run_in_executor(None, self._load_tokenizer)
                 self.session = await loop.run_in_executor(None, self._load_onnx_session)
                 logger.info("[ONNXEmbedding] 模型加载成功")
             except Exception as e:
                 logger.error("[ONNXEmbedding] 模型加载失败", exc_info=True)
                 raise RuntimeError(f"模型加载失败: {e}") from e
+
+    async def _download_model_if_needed(self):
+        if self._check_model_exists():
+            return
+
+        if not self.auto_download:
+            raise FileNotFoundError(
+                f"模型文件不存在: {self.model_path}，且未启用自动下载。"
+                f"请手动下载模型或启用自动下载功能。"
+            )
+
+        model_name = self._extract_model_name_from_path()
+        if not model_name:
+            raise FileNotFoundError(
+                f"模型文件不存在: {self.model_path}，且无法从路径推断模型名称。"
+                f"请手动下载模型或使用 HuggingFace 模型名称作为路径。"
+            )
+
+        logger.info(f"[ONNXEmbedding] 模型不存在，开始自动下载: {model_name}")
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None,
+            _download_model_from_hf,
+            model_name,
+            self.model_path,
+            self.hf_mirror,
+        )
+
+    def _check_model_exists(self) -> bool:
+        model_path = Path(self.model_path)
+        if model_path.is_file():
+            return True
+        if model_path.is_dir():
+            onnx_files = list(model_path.glob("*.onnx"))
+            if onnx_files:
+                return True
+        return False
+
+    def _extract_model_name_from_path(self) -> str | None:
+        path_str = str(self.model_path)
+        if "/" in path_str or "\\" in path_str:
+            parts = path_str.replace("\\", "/").rstrip("/").split("/")
+            if len(parts) >= 2:
+                return f"{parts[-2]}/{parts[-1]}"
+            return parts[-1]
+        return path_str
 
     def _cleanup_resources(self) -> bool:
         """
@@ -421,6 +544,8 @@ class ONNXEmbedding(Star):
                 "ONNXEmbedding_tokenizer_path": "",
                 "ONNXEmbedding_optimization_level": "disable",
                 "ONNXEmbedding_max_length": 256,
+                "huggingface_mirror": "",
+                "auto_download": 1,
                 "provider_type": "embedding",
                 "enable": True,
                 "embedding_dimensions": 384,
@@ -452,6 +577,18 @@ class ONNXEmbedding(Star):
                 "ONNXEmbedding_max_length"
             ] = {
                 "description": "最大序列长度（默认256），超过会被截断",
+                "type": "int",
+            }
+            CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"][
+                "huggingface_mirror"
+            ] = {
+                "description": "HuggingFace 镜像地址（留空使用官方源，如：https://hf-mirror.com）",
+                "type": "string",
+            }
+            CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"][
+                "auto_download"
+            ] = {
+                "description": "模型文件不存在时是否自动从 HuggingFace 下载（0=否，1=是）",
                 "type": "int",
             }
         except KeyError:
