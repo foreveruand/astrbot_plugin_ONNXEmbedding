@@ -133,7 +133,7 @@ class ONNXEmbeddingProvider(EmbeddingProvider):
         # -------- 模型路径处理（Pathlib）--------
         base_path = provider_config.get("ONNXEmbedding_path", DEFAULT_MODEL_NAME)
 
-        data_dir = Path(StarTools.get_data_dir())
+        data_dir = Path(StarTools.get_data_dir("ONNXEmbedding"))
         base_path = Path(base_path)
 
         self.model_path = base_path if base_path.is_absolute() else data_dir / base_path
@@ -182,7 +182,9 @@ class ONNXEmbeddingProvider(EmbeddingProvider):
 
         tokenizer_path = Path(self.tokenizer_path)
         if not tokenizer_path.is_absolute():
-            tokenizer_path = Path(StarTools.get_data_dir()) / tokenizer_path
+            tokenizer_path = (
+                Path(StarTools.get_data_dir("ONNXEmbedding")) / tokenizer_path
+            )
 
         if tokenizer_path.exists():
             tokenizer = Tokenizer.from_file(str(tokenizer_path))

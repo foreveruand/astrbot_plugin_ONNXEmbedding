@@ -83,7 +83,7 @@ class ONNXRerankProvider(RerankProvider):
         self.auto_download = provider_config.get("auto_download", 1) == 1
 
         base_path = provider_config.get("ONNXRerank_path", DEFAULT_RERANK_MODEL)
-        data_dir = Path(StarTools.get_data_dir())
+        data_dir = Path(StarTools.get_data_dir("ONNXEmbedding"))
         base_path = Path(base_path)
         self.model_path = base_path if base_path.is_absolute() else data_dir / base_path
 
@@ -127,7 +127,9 @@ class ONNXRerankProvider(RerankProvider):
 
         tokenizer_path = Path(self.tokenizer_path)
         if not tokenizer_path.is_absolute():
-            tokenizer_path = Path(StarTools.get_data_dir()) / tokenizer_path
+            tokenizer_path = (
+                Path(StarTools.get_data_dir("ONNXEmbedding")) / tokenizer_path
+            )
 
         if tokenizer_path.exists():
             tokenizer = Tokenizer.from_file(str(tokenizer_path))
