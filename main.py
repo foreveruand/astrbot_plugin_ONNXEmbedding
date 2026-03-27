@@ -116,23 +116,35 @@ def _mean_pooling(
     return sum_embeddings / mask_sum
 
 
+# 全局插件配置（供 Provider 访问）
+_PLUGIN_CONFIG: dict = {}
+
+
+def get_plugin_config() -> dict:
+    return _PLUGIN_CONFIG
+
+
 # ============================================================
 # Embedding Provider
 # ============================================================
 class ONNXEmbeddingProvider(EmbeddingProvider):
-    """ONNX Runtime based embedding provider"""
-
     def __init__(self, provider_config: dict, provider_settings: dict) -> None:
         super().__init__(provider_config, provider_settings)
 
-        # -------- 下载相关配置 --------
+        # -------- 下载相关配置（优先从 Provider 配置读取，否则从插件全局配置读取）--------
         self.hf_mirror = provider_config.get(
-            "huggingface_mirror", DEFAULT_HUGGINGFACE_MIRROR
+            "huggingface_mirror",
+            _PLUGIN_CONFIG.get("huggingface_mirror", DEFAULT_HUGGINGFACE_MIRROR),
         )
-        self.auto_download = provider_config.get("auto_download", 1) == 1
+        self.auto_download = (
+            provider_config.get("auto_download", _PLUGIN_CONFIG.get("auto_download", 1))
+            == 1
+        )
 
         # -------- 自动卸载配置 --------
-        self.auto_unload_timeout = provider_config.get("auto_unload_timeout", 0)
+        self.auto_unload_timeout = provider_config.get(
+            "auto_unload_timeout", _PLUGIN_CONFIG.get("auto_unload_timeout", 0)
+        )
         self._last_used_time: float = 0
         self._auto_unload_task: asyncio.Task | None = None
         self._shutdown_event = asyncio.Event()
@@ -427,7 +439,11 @@ class ONNXEmbeddingProvider(EmbeddingProvider):
         self._last_used_time = time.time()
 
     def _start_auto_unload_task(self):
+        logger.info(
+            f"[ONNXEmbedding] 自动卸载超时配置: {self.auto_unload_timeout} 分钟"
+        )
         if self.auto_unload_timeout <= 0:
+            logger.info("[ONNXEmbedding] 自动卸载未启用（auto_unload_timeout <= 0）")
             return
         if self._auto_unload_task is not None and not self._auto_unload_task.done():
             return
@@ -631,6 +647,9 @@ class ONNXEmbedding(Star):
         self.config = config
         self.auto_start = self.config.get("auto_start", 0) == 1
 
+        global _PLUGIN_CONFIG
+        _PLUGIN_CONFIG = dict(self.config)
+
     # --------------------------------------------------------
     def _register_config(self):
         if self._registered:
@@ -644,6 +663,9 @@ class ONNXEmbedding(Star):
                 "type": "ONNXEmbedding",
                 "provider": "Local",
                 "ONNXEmbedding_path": DEFAULT_MODEL_NAME,
+                "huggingface_mirror": self.config.get("huggingface_mirror", ""),
+                "auto_download": self.config.get("auto_download", 1),
+                "auto_unload_timeout": self.config.get("auto_unload_timeout", 0),
                 "provider_type": "embedding",
                 "enable": True,
                 "embedding_dimensions": 384,

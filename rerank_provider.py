@@ -75,15 +75,23 @@ def _download_rerank_model_from_hf(
 
 
 class ONNXRerankProvider(RerankProvider):
-    """ONNX Runtime based rerank provider"""
-
     def __init__(self, provider_config: dict, provider_settings: dict) -> None:
         super().__init__(provider_config, provider_settings)
 
-        self.hf_mirror = provider_config.get("huggingface_mirror", "")
-        self.auto_download = provider_config.get("auto_download", 1) == 1
+        from main import get_plugin_config
 
-        self.auto_unload_timeout = provider_config.get("auto_unload_timeout", 0)
+        plugin_config = get_plugin_config()
+        self.hf_mirror = provider_config.get(
+            "huggingface_mirror", plugin_config.get("huggingface_mirror", "")
+        )
+        self.auto_download = (
+            provider_config.get("auto_download", plugin_config.get("auto_download", 1))
+            == 1
+        )
+
+        self.auto_unload_timeout = provider_config.get(
+            "auto_unload_timeout", plugin_config.get("auto_unload_timeout", 0)
+        )
         self._last_used_time: float = 0
         self._auto_unload_task: asyncio.Task | None = None
         self._shutdown_event = asyncio.Event()
@@ -295,7 +303,9 @@ class ONNXRerankProvider(RerankProvider):
         self._last_used_time = time.time()
 
     def _start_auto_unload_task(self):
+        logger.info(f"[ONNXRerank] 自动卸载超时配置: {self.auto_unload_timeout} 分钟")
         if self.auto_unload_timeout <= 0:
+            logger.info("[ONNXRerank] 自动卸载未启用（auto_unload_timeout <= 0）")
             return
         if self._auto_unload_task is not None and not self._auto_unload_task.done():
             return
