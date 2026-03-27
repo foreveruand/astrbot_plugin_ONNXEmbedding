@@ -22,8 +22,7 @@ from astrbot.core.provider.register import (
     register_provider_adapter,
 )
 
-# 导入 Chat Provider
-from .provider_chat import ONNXChatProvider, register_ONNXChatProvider
+from .rerank_provider import ONNXRerankProvider, register_ONNXRerankProvider
 
 DEFAULT_MODEL_NAME = "all-MiniLM-L6-v2"
 DEFAULT_ONNX_URL = "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx"
@@ -609,55 +608,51 @@ class ONNXEmbedding(Star):
         if not already_registered:
             register_ONNXEmbeddingProvider()
 
-        # ---- Chat Provider 注册 ----
-        chat_already_registered = False
+        # ---- Rerank Provider 注册 ----
+        rerank_already_registered = False
         if isinstance(provider_registry, list):
             for p in provider_registry:
-                if getattr(p, "type", None) == "ONNXChat":
-                    chat_already_registered = True
+                if getattr(p, "type", None) == "ONNXRerank":
+                    rerank_already_registered = True
                     break
 
-        if not chat_already_registered:
-            register_ONNXChatProvider()
-            # 注册 Chat Provider 配置
+        if not rerank_already_registered:
+            register_ONNXRerankProvider()
             try:
                 CONFIG_METADATA_2["provider_group"]["metadata"]["provider"][
                     "config_template"
-                ]["ONNXChat"] = {
-                    "id": "ONNXChat",
-                    "type": "ONNXChat",
+                ]["ONNXRerank"] = {
+                    "id": "ONNXRerank",
+                    "type": "ONNXRerank",
                     "provider": "Local",
-                    "ONNXChat_model_path": "",
-                    "ONNXChat_tokenizer_path": "",
-                    "ONNXChat_model_name": "onnx-chat-model",
-                    "ONNXChat_max_length": 512,
-                    "ONNXChat_max_new_tokens": 128,
-                    "ONNXChat_temperature": 0.8,
-                    "ONNXChat_top_p": 0.9,
-                    "ONNXChat_top_k": 50,
-                    "provider_type": "chat_completion",
+                    "ONNXRerank_path": "BAAI/bge-reranker-base",
+                    "ONNXRerank_tokenizer_path": "",
+                    "ONNXRerank_max_length": 512,
+                    "huggingface_mirror": "",
+                    "auto_download": 1,
+                    "provider_type": "rerank",
                     "enable": True,
                 }
                 CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"][
-                    "ONNXChat_model_path"
+                    "ONNXRerank_path"
                 ] = {
-                    "description": "ONNX 聊天模型路径（目录或.onnx文件）",
+                    "description": "ONNX Rerank 模型路径（目录或.onnx文件）",
                     "type": "string",
                 }
                 CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"][
-                    "ONNXChat_max_new_tokens"
+                    "ONNXRerank_tokenizer_path"
                 ] = {
-                    "description": "最大生成token数（默认128）",
-                    "type": "int",
+                    "description": "Tokenizer 文件路径（可选，默认从模型目录查找）",
+                    "type": "string",
                 }
                 CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"][
-                    "ONNXChat_temperature"
+                    "ONNXRerank_max_length"
                 ] = {
-                    "description": "采样温度（默认0.8）",
-                    "type": "float",
+                    "description": "最大序列长度（默认512）",
+                    "type": "int",
                 }
             except KeyError:
-                logger.warning("[ONNXChat] 无法注册 Chat Provider 配置")
+                logger.warning("[ONNXRerank] 无法注册 Rerank Provider 配置")
 
         self._registered = True
         logger.info("[ONNXEmbedding] 配置与 Provider 注册完成")
@@ -680,6 +675,28 @@ class ONNXEmbedding(Star):
             CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"].pop(
                 "ONNXEmbedding_max_length", None
             )
+            CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"].pop(
+                "huggingface_mirror", None
+            )
+            CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"].pop(
+                "auto_download", None
+            )
+        except KeyError:
+            pass
+
+        try:
+            CONFIG_METADATA_2["provider_group"]["metadata"]["provider"][
+                "config_template"
+            ].pop("ONNXRerank", None)
+            CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"].pop(
+                "ONNXRerank_path", None
+            )
+            CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"].pop(
+                "ONNXRerank_tokenizer_path", None
+            )
+            CONFIG_METADATA_2["provider_group"]["metadata"]["provider"]["items"].pop(
+                "ONNXRerank_max_length", None
+            )
         except KeyError:
             pass
 
@@ -695,13 +712,13 @@ class ONNXEmbedding(Star):
 
     @onnx.command("help")
     async def help_cmd(self, event: AstrMessageEvent):
-        """获取帮助信息"""
         help_text = [
             "ONNXEmbedding 插件 - 基于ONNX Runtime的轻量级嵌入向量生成插件",
             "/onnx register                      注册 Provider",
             "/onnx redb                          重新加载数据库",
             "/onnx kbinfo                        获取所有数据库以及其对应的embedding_provider_id",
             "/onnx unload [embedding_provider_id] 卸载指定Provider的权重",
+            "/onnx query <知识库名> <查询内容>     直接查询向量数据库，返回前2条结果",
         ]
         yield event.plain_result("\n".join(help_text))
 
@@ -732,7 +749,6 @@ class ONNXEmbedding(Star):
 
     @onnx.command("unload")
     async def unload_kbw(self, event: AstrMessageEvent, embedding_provider_id: str):
-        """清理权重，防止用不到权重时占用太多内存"""
         pm = self.context.provider_manager.get_provider_by_id(embedding_provider_id)
         if isinstance(pm, ONNXEmbeddingProvider):
             yield event.plain_result(f"[ONNXEmbedding] 正在清理权重")
@@ -747,6 +763,51 @@ class ONNXEmbedding(Star):
             logger.info(
                 f"[ONNXEmbedding] 编码器实例:{embedding_provider_id},不为ONNXEmbeddingProvider"
             )
+
+    @onnx.command("query")
+    async def query_kb(self, event: AstrMessageEvent, kb_name: str, *query_parts: str):
+        query_text = " ".join(query_parts)
+        if not query_text:
+            yield event.plain_result("[ONNXEmbedding] 请提供查询内容")
+            return
+
+        kb_manager = self.context.kb_manager
+        kb_helper = await kb_manager.get_kb_by_name(kb_name)
+        if not kb_helper:
+            yield event.plain_result(f"[ONNXEmbedding] 未找到知识库: {kb_name}")
+            return
+
+        yield event.plain_result(f"[ONNXEmbedding] 正在查询知识库 '{kb_name}'...")
+
+        try:
+            results = await kb_manager.retrieve(
+                query=query_text,
+                kb_names=[kb_name],
+                top_k_fusion=10,
+                top_m_final=2,
+            )
+
+            if not results or not results.get("results"):
+                yield event.plain_result(f"[ONNXEmbedding] 未找到相关内容")
+                return
+
+            output_lines = [f"查询结果 (知识库: {kb_name}):"]
+            for i, r in enumerate(results["results"], 1):
+                content = r.get("content", "")
+                score = r.get("score", 0)
+                doc_name = r.get("doc_name", "未知文档")
+                output_lines.append(f"\n【结果 {i}】")
+                output_lines.append(f"来源: {doc_name}")
+                output_lines.append(f"相关度: {score:.4f}")
+                output_lines.append(
+                    f"内容: {content[:200]}{'...' if len(content) > 200 else ''}"
+                )
+
+            yield event.plain_result("\n".join(output_lines))
+
+        except Exception as e:
+            logger.error(f"[ONNXEmbedding] 查询失败: {e}", exc_info=True)
+            yield event.plain_result(f"[ONNXEmbedding] 查询失败: {e}")
 
     # --------------------------------------------------------
     # 生命周期
