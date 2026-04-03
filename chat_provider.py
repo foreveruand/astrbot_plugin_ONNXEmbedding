@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import os  # noqa: F401 (required by openvino_genai)
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any, Literal
