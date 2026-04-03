@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import json
 import os  # noqa: F401 (required by openvino_genai)
 from collections.abc import AsyncGenerator
 from pathlib import Path
@@ -326,15 +327,286 @@ class ONNXChatProvider(Provider):
                 return True
         return False
 
+    @staticmethod
+    def _first_existing_relative_path(root: Path, patterns: list[str]) -> str | None:
+        """Return the first file path matching *patterns*, relative to *root*."""
+        for pattern in patterns:
+            for candidate in sorted(root.rglob(pattern)):
+                if candidate.is_file():
+                    return str(candidate.relative_to(root))
+        return None
+
+    def _ensure_genai_config(self, model_root: Path) -> Path:
+        """Ensure a usable `genai_config.json` exists for ORT GenAI models."""
+        model_root = Path(model_root)
+        config_path = model_root / "genai_config.json"
+        if config_path.exists():
+            return config_path
+
+        genai_config = self._build_genai_config(model_root)
+        if genai_config is None:
+            raise RuntimeError(
+                "[ONNXChat] 当前 ONNX 模型缺少 genai_config.json，且无法自动生成。"
+                "请使用 ONNX Runtime GenAI 导出的模型目录，或改用 OpenVINO 模型。"
+            )
+
+        config_path.write_text(
+            json.dumps(genai_config, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        logger.info(f"[ONNXChat] 已自动生成 genai_config.json: {config_path}")
+        return config_path
+
+    def _build_genai_config(self, model_root: Path) -> dict | None:
+        """Build a minimal ORT GenAI config from HF `config.json` files.
+
+        This is primarily for repos like `onnx-community/Qwen3.5-0.8B-ONNX`
+        which contain valid ONNX weights but do not ship a prebuilt
+        `genai_config.json`.
+        """
+        config_file = model_root / "config.json"
+        if not config_file.exists():
+            return None
+
+        try:
+            raw_cfg = json.loads(config_file.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning(f"[ONNXChat] 读取 config.json 失败: {exc}")
+            return None
+
+        generation_cfg: dict[str, Any] = {}
+        generation_config_file = model_root / "generation_config.json"
+        if generation_config_file.exists():
+            try:
+                generation_cfg = json.loads(
+                    generation_config_file.read_text(encoding="utf-8")
+                )
+            except Exception:
+                generation_cfg = {}
+
+        text_cfg = raw_cfg.get("text_config") or raw_cfg
+        model_type = str(
+            raw_cfg.get("model_type") or text_cfg.get("model_type") or "generic"
+        ).lower()
+
+        decoder_filename = self._first_existing_relative_path(
+            model_root,
+            [
+                "decoder_model_merged*.onnx",
+                "decoder*.onnx",
+                "model*.onnx",
+            ],
+        )
+        if not decoder_filename:
+            return None
+
+        embed_filename = self._first_existing_relative_path(
+            model_root,
+            ["embed_tokens*.onnx", "embedding*.onnx"],
+        )
+        vision_filename = self._first_existing_relative_path(
+            model_root,
+            ["vision_encoder*.onnx", "vision*.onnx"],
+        )
+
+        hidden_size = int(
+            text_cfg.get("hidden_size") or raw_cfg.get("hidden_size") or 0
+        )
+        num_heads = int(
+            text_cfg.get("num_attention_heads")
+            or raw_cfg.get("num_attention_heads")
+            or 0
+        )
+        num_layers = int(
+            text_cfg.get("num_hidden_layers") or raw_cfg.get("num_hidden_layers") or 0
+        )
+        num_kv_heads = int(
+            text_cfg.get("num_key_value_heads")
+            or raw_cfg.get("num_key_value_heads")
+            or num_heads
+            or 0
+        )
+        vocab_size = int(text_cfg.get("vocab_size") or raw_cfg.get("vocab_size") or 0)
+        context_length = int(
+            text_cfg.get("max_position_embeddings")
+            or raw_cfg.get("max_position_embeddings")
+            or self.context_length
+        )
+        head_size = hidden_size // num_heads if hidden_size and num_heads else 0
+
+        eos_token_id = (
+            generation_cfg.get("eos_token_id")
+            or text_cfg.get("eos_token_id")
+            or raw_cfg.get("eos_token_id")
+            or 1
+        )
+        if not isinstance(eos_token_id, list):
+            eos_token_id = [eos_token_id]
+
+        bos_token_id = (
+            generation_cfg.get("bos_token_id")
+            or text_cfg.get("bos_token_id")
+            or raw_cfg.get("bos_token_id")
+        )
+        if bos_token_id is None:
+            bos_token_id = eos_token_id[0] if eos_token_id else 1
+
+        pad_token_id = (
+            generation_cfg.get("pad_token_id")
+            or text_cfg.get("pad_token_id")
+            or raw_cfg.get("pad_token_id")
+        )
+        if pad_token_id is None:
+            pad_token_id = bos_token_id
+
+        decoder_inputs = {
+            ("inputs_embeds" if embed_filename else "input_ids"): (
+                "inputs_embeds" if embed_filename else "input_ids"
+            ),
+            "attention_mask": "attention_mask",
+            "position_ids": "position_ids",
+            "past_key_names": "past_key_values.%d.key",
+            "past_value_names": "past_key_values.%d.value",
+        }
+
+        model_section: dict[str, Any] = {
+            "bos_token_id": bos_token_id,
+            "context_length": context_length,
+            "decoder": {
+                "session_options": {
+                    "log_id": "onnxruntime-genai",
+                    "provider_options": [],
+                },
+                "filename": decoder_filename,
+                "head_size": head_size,
+                "hidden_size": hidden_size,
+                "inputs": decoder_inputs,
+                "outputs": {
+                    "logits": "logits",
+                    "present_key_names": "present.%d.key",
+                    "present_value_names": "present.%d.value",
+                },
+                "num_attention_heads": num_heads,
+                "num_hidden_layers": num_layers,
+                "num_key_value_heads": num_kv_heads,
+            },
+            "eos_token_id": eos_token_id,
+            "pad_token_id": pad_token_id,
+            "type": raw_cfg.get("model_type") or model_type,
+            "vocab_size": vocab_size,
+        }
+
+        if embed_filename:
+            model_section["embedding"] = {
+                "filename": embed_filename,
+                "inputs": {
+                    "input_ids": "input_ids",
+                    "image_features": "image_features",
+                },
+                "outputs": {"inputs_embeds": "inputs_embeds"},
+            }
+
+        if vision_filename:
+            vision_cfg = raw_cfg.get("vision_config") or {}
+            model_section["vision"] = {
+                "filename": vision_filename,
+                "spatial_merge_size": int(vision_cfg.get("spatial_merge_size") or 2),
+                "patch_size": int(vision_cfg.get("patch_size") or 14),
+                "inputs": {
+                    "pixel_values": "pixel_values",
+                    "image_grid_thw": "image_grid_thw",
+                },
+                "outputs": {"image_features": "image_features"},
+            }
+
+        for token_key in (
+            "image_token_id",
+            "video_token_id",
+            "vision_start_token_id",
+            "vision_end_token_id",
+        ):
+            if raw_cfg.get(token_key) is not None:
+                model_section[token_key] = raw_cfg[token_key]
+
+        search_section = {
+            "diversity_penalty": float(generation_cfg.get("diversity_penalty", 0.0)),
+            "do_sample": bool(generation_cfg.get("do_sample", self.temperature > 0)),
+            "early_stopping": True,
+            "length_penalty": float(generation_cfg.get("length_penalty", 1.0)),
+            "max_length": int(generation_cfg.get("max_length", context_length)),
+            "min_length": int(generation_cfg.get("min_length", 0)),
+            "no_repeat_ngram_size": int(generation_cfg.get("no_repeat_ngram_size", 0)),
+            "num_beams": int(generation_cfg.get("num_beams", 1)),
+            "num_return_sequences": int(generation_cfg.get("num_return_sequences", 1)),
+            "past_present_share_buffer": False,
+            "repetition_penalty": float(generation_cfg.get("repetition_penalty", 1.0)),
+            "temperature": float(generation_cfg.get("temperature", 1.0)),
+            "top_k": int(generation_cfg.get("top_k", 50)),
+            "top_p": float(generation_cfg.get("top_p", 1.0)),
+        }
+
+        return {"model": model_section, "search": search_section}
+
     def _load_openvino_pipeline(self, model_path: str) -> tuple:
         import openvino_genai as ov_genai
 
+        def _try_load(target_path: str, target_device: str):
+            pipeline_obj = ov_genai.LLMPipeline(target_path, target_device)
+            try:
+                tokenizer = pipeline_obj.get_tokenizer()
+                chat_template = getattr(tokenizer, "chat_template", None)
+                if chat_template:
+                    tokenizer.set_chat_template(chat_template)
+                    logger.info(
+                        "[ONNXChat] 已按 OpenVINO/HuggingFace 推荐方式启用 chat template"
+                    )
+            except Exception as exc:
+                logger.debug(
+                    f"[ONNXChat] 设置 OpenVINO chat template 失败，继续使用默认提示词: {exc}"
+                )
+            logger.info(f"[ONNXChat] OpenVINO GenAI 加载成功 device={target_device}")
+            return ("openvino", pipeline_obj)
+
+        def _should_refresh_download(exc: Exception) -> bool:
+            text = str(exc)
+            markers = (
+                "Incorrect weights in bin file",
+                "Could not find a model in the directory",
+                "Error opening",
+            )
+            return any(marker in text for marker in markers)
+
         device = self.device
         try:
-            pipeline = ov_genai.LLMPipeline(model_path, device)
-            logger.info(f"[ONNXChat] OpenVINO GenAI 加载成功 device={device}")
-            return ("openvino", pipeline)
+            return _try_load(model_path, device)
         except Exception as exc:
+            model_name = str(
+                self.provider_config.get("ONNXChat_path", DEFAULT_CHAT_MODEL)
+            )
+            if (
+                self.auto_download
+                and not Path(model_name).is_absolute()
+                and _should_refresh_download(exc)
+            ):
+                logger.warning(
+                    "[ONNXChat] 检测到 OpenVINO 模型文件损坏或不完整，尝试强制重新下载..."
+                )
+                ok, failed = download_chat_model(
+                    model_name,
+                    self.model_path,
+                    self.hf_mirror,
+                    "openvino",
+                    True,
+                )
+                if ok:
+                    refreshed_path = str(self._resolve_model_dir())
+                    try:
+                        return _try_load(refreshed_path, device)
+                    except Exception as retry_exc:
+                        exc = retry_exc
+                else:
+                    logger.warning(f"[ONNXChat] 强制重新下载失败，缺失文件: {failed}")
+
             if device == "CPU":
                 raise RuntimeError(
                     f"[ONNXChat] OpenVINO GenAI 加载失败 (device={device}): {exc}"
@@ -342,16 +614,24 @@ class ONNXChatProvider(Provider):
             logger.warning(
                 f"[ONNXChat] OpenVINO GenAI 加载失败 (device={device}): {exc}，回退到 CPU"
             )
-            pipeline = ov_genai.LLMPipeline(model_path, "CPU")
-            logger.info("[ONNXChat] OpenVINO GenAI (CPU fallback) 加载成功")
-            return ("openvino", pipeline)
+            return _try_load(model_path, "CPU")
 
     def _load_ortgenai_pipeline(self, model_path: str) -> tuple:
         import onnxruntime_genai as ortg
 
-        model = ortg.Model(model_path)
+        requested_root = Path(model_path)
+        config_root = requested_root
+        if (
+            not (config_root / "config.json").exists()
+            and (config_root.parent / "config.json").exists()
+        ):
+            config_root = config_root.parent
+
+        self._ensure_genai_config(config_root)
+
+        model = ortg.Model(str(config_root))
         tokenizer = ortg.Tokenizer(model)
-        logger.info("[ONNXChat] ONNX Runtime GenAI 加载成功")
+        logger.info(f"[ONNXChat] ONNX Runtime GenAI 加载成功 root={config_root}")
         return ("onnxruntime", model, tokenizer)
 
     # ------------------------------------------------------------------

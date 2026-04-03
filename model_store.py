@@ -161,20 +161,21 @@ def download_chat_model(
     output_dir: Path,
     hf_mirror: str = "",
     backend: str = "auto",
+    force_download: bool = False,
 ) -> tuple[bool, list[str]]:
-    """Download a quantized LLM into *output_dir* using Hugging Face APIs.
+    """Download a local chat model into *output_dir* using Hugging Face Hub.
 
-    This uses ``HfApi.list_repo_files`` + ``hf_hub_download`` rather than a
-    broad snapshot call so every repo file is downloaded into the specified
-    target directory with its relative structure preserved (for example
-    ``onnx/*.onnx``). This avoids the previous issue where only config JSONs
-    appeared locally but the actual model weights were missing.
+    This now follows the Hugging Face OpenVINO docs more closely by preferring
+    ``snapshot_download(local_dir=...)`` for complete repo checkout. That keeps
+    OpenVINO bundles such as ``openvino_model.xml/.bin`` and tokenizer files in
+    the exact structure expected by ``openvino_genai.LLMPipeline``.
 
     Args:
         model_name: HuggingFace model slug.
         output_dir: Local directory to write files into.
         hf_mirror: Optional HuggingFace endpoint/mirror.
-        backend: Kept for API compatibility; currently unused.
+        backend: Kept for API compatibility.
+        force_download: Refresh files even if they already exist locally.
 
     Returns:
         ``(success, error_messages)``
@@ -182,52 +183,74 @@ def download_chat_model(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    ignore_patterns = [
+        "original/*",
+        "pytorch_model*.bin",
+        "model.safetensors",
+        "model.safetensors.index.json",
+        "*.msgpack",
+        "*.h5",
+        "flax_model*",
+        "tf_model*.h5",
+        "rust_model.ot",
+        "training_args.bin",
+    ]
+
     try:
-        from huggingface_hub import HfApi, hf_hub_download
+        from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 
         endpoint = hf_mirror.rstrip("/") if hf_mirror else None
-        api = HfApi(endpoint=endpoint) if endpoint else HfApi()
-        repo_files = api.list_repo_files(model_name, repo_type="model")
-
-        selected_files: list[str] = []
-        for repo_file in repo_files:
-            lower = repo_file.lower()
-            basename = Path(repo_file).name.lower()
-
-            # Skip original training checkpoints or unrelated framework weights.
-            if repo_file.startswith("original/"):
-                continue
-            if basename.startswith(("pytorch_model", "flax_model", "tf_model")):
-                continue
-            if basename in {
-                "model.safetensors",
-                "model.safetensors.index.json",
-                "training_args.bin",
-                "rust_model.ot",
-            }:
-                continue
-            if lower.endswith((".msgpack", ".h5", ".safetensors")):
-                continue
-
-            selected_files.append(repo_file)
-
-        if not selected_files:
-            logger.error(f"[ModelStore] 仓库 {model_name} 中没有可下载的模型文件")
-            return False, ["仓库中没有可下载的模型文件"]
+        snapshot_kwargs: dict[str, object] = {
+            "repo_id": model_name,
+            "local_dir": str(output_dir),
+            "ignore_patterns": ignore_patterns,
+            "force_download": force_download,
+        }
+        if endpoint:
+            snapshot_kwargs["endpoint"] = endpoint
 
         logger.info(
-            f"[ModelStore] 开始下载 Chat 模型 (hf_hub_download): {model_name} → {output_dir} "
-            f"(共 {len(selected_files)} 个文件)"
+            f"[ModelStore] 开始下载 Chat 模型 (snapshot_download): {model_name} → {output_dir}"
         )
+        try:
+            # Newer huggingface_hub versions support local_dir_use_symlinks=False;
+            # keep a compatibility fallback for older releases.
+            snapshot_download(local_dir_use_symlinks=False, **snapshot_kwargs)
+        except TypeError:
+            snapshot_download(**snapshot_kwargs)
 
-        for repo_file in selected_files:
-            hf_hub_download(
-                repo_id=model_name,
-                filename=repo_file,
-                repo_type="model",
-                local_dir=str(output_dir),
-                endpoint=endpoint,
+        if not check_model_exists(output_dir):
+            # Fallback: explicitly download the listed repo files into local_dir.
+            api = HfApi(endpoint=endpoint) if endpoint else HfApi()
+            repo_files = api.list_repo_files(model_name, repo_type="model")
+            logger.warning(
+                f"[ModelStore] snapshot_download 后未发现模型权重，尝试逐文件补全 ({len(repo_files)} 个文件)"
             )
+            for repo_file in repo_files:
+                lower = repo_file.lower()
+                basename = Path(repo_file).name.lower()
+                if repo_file.startswith("original/"):
+                    continue
+                if basename.startswith(("pytorch_model", "flax_model", "tf_model")):
+                    continue
+                if basename in {
+                    "model.safetensors",
+                    "model.safetensors.index.json",
+                    "training_args.bin",
+                    "rust_model.ot",
+                }:
+                    continue
+                if lower.endswith((".msgpack", ".h5", ".safetensors")):
+                    continue
+
+                hf_hub_download(
+                    repo_id=model_name,
+                    filename=repo_file,
+                    repo_type="model",
+                    local_dir=str(output_dir),
+                    endpoint=endpoint,
+                    force_download=force_download,
+                )
 
         _write_manifest(output_dir, model_name)
         if not check_model_exists(output_dir):
@@ -250,14 +273,23 @@ def download_chat_model(
 
 
 def check_model_exists(model_dir: Path) -> bool:
-    """Return True if *model_dir* or its subdirectories contain model files."""
+    """Return True if *model_dir* contains a usable ONNX/OpenVINO model bundle."""
     model_dir = Path(model_dir)
     if not model_dir.is_dir():
         return False
+
+    # Any ONNX file counts as present. Some repos also include split `.onnx_data*`
+    # shards, but the base `.onnx` file is the key signal.
     if any(True for _ in model_dir.rglob("*.onnx")):
         return True
-    if any(True for _ in model_dir.rglob("*.xml")):
-        return True
+
+    # OpenVINO models require a matching `.xml` + `.bin` pair. Reject tiny bin
+    # files as they are usually pointer/partial downloads and will fail at load time.
+    for xml_file in model_dir.rglob("*.xml"):
+        bin_file = xml_file.with_suffix(".bin")
+        if bin_file.exists() and bin_file.stat().st_size > 4096:
+            return True
+
     return False
 
 
