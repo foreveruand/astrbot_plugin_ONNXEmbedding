@@ -162,18 +162,19 @@ def download_chat_model(
     hf_mirror: str = "",
     backend: str = "auto",
 ) -> tuple[bool, list[str]]:
-    """Download a quantized LLM for local GenAI inference.
+    """Download a quantized LLM into *output_dir* using Hugging Face APIs.
 
-    Uses ``huggingface_hub.snapshot_download`` which correctly handles LFS
-    weight files and arbitrary per-model file layouts.  Falls back to the
-    simpler ``download_model()`` if *huggingface_hub* is not installed.
+    This uses ``HfApi.list_repo_files`` + ``hf_hub_download`` rather than a
+    broad snapshot call so every repo file is downloaded into the specified
+    target directory with its relative structure preserved (for example
+    ``onnx/*.onnx``). This avoids the previous issue where only config JSONs
+    appeared locally but the actual model weights were missing.
 
     Args:
-        model_name: HuggingFace model slug, e.g. ``"Intel/neural-chat-7b-v3-3-int4-ov"``.
+        model_name: HuggingFace model slug.
         output_dir: Local directory to write files into.
-        hf_mirror: Optional HuggingFace endpoint/mirror (e.g. ``"https://hf-mirror.com"``).
-        backend: ``"openvino"`` | ``"onnxruntime"`` | ``"auto"`` — determines which
-            weight files to include via ``allow_patterns``.
+        hf_mirror: Optional HuggingFace endpoint/mirror.
+        backend: Kept for API compatibility; currently unused.
 
     Returns:
         ``(success, error_messages)``
@@ -181,44 +182,58 @@ def download_chat_model(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Build allow/ignore patterns based on target backend
-    base_patterns = ["*.json", "*.txt", "tokenizer.model", "*.tiktoken"]
-    weight_patterns: list[str] = []
-    if backend in ("openvino", "auto"):
-        weight_patterns += ["*.xml", "*.bin"]
-    if backend in ("onnxruntime", "auto"):
-        weight_patterns += ["*.onnx", "*.onnx.data"]
-    allow_patterns = base_patterns + weight_patterns
-
-    # Skip original training weights — we only need already-quantized artifacts
-    ignore_patterns = [
-        "pytorch_model*.bin",
-        "model.safetensors*",
-        "*.msgpack",
-        "*.h5",
-        "flax_model*",
-        "tf_model*.h5",
-        "rust_model.ot",
-        "training_args.bin",
-    ]
-
     try:
-        from huggingface_hub import snapshot_download
+        from huggingface_hub import HfApi, hf_hub_download
 
-        kwargs: dict = {
-            "repo_id": model_name,
-            "local_dir": str(output_dir),
-            "allow_patterns": allow_patterns,
-            "ignore_patterns": ignore_patterns,
-        }
-        if hf_mirror:
-            kwargs["endpoint"] = hf_mirror.rstrip("/")
+        endpoint = hf_mirror.rstrip("/") if hf_mirror else None
+        api = HfApi(endpoint=endpoint) if endpoint else HfApi()
+        repo_files = api.list_repo_files(model_name, repo_type="model")
+
+        selected_files: list[str] = []
+        for repo_file in repo_files:
+            lower = repo_file.lower()
+            basename = Path(repo_file).name.lower()
+
+            # Skip original training checkpoints or unrelated framework weights.
+            if repo_file.startswith("original/"):
+                continue
+            if basename.startswith(("pytorch_model", "flax_model", "tf_model")):
+                continue
+            if basename in {
+                "model.safetensors",
+                "model.safetensors.index.json",
+                "training_args.bin",
+                "rust_model.ot",
+            }:
+                continue
+            if lower.endswith((".msgpack", ".h5", ".safetensors")):
+                continue
+
+            selected_files.append(repo_file)
+
+        if not selected_files:
+            logger.error(f"[ModelStore] 仓库 {model_name} 中没有可下载的模型文件")
+            return False, ["仓库中没有可下载的模型文件"]
 
         logger.info(
-            f"[ModelStore] 开始下载 Chat 模型 (snapshot): {model_name} → {output_dir}"
+            f"[ModelStore] 开始下载 Chat 模型 (hf_hub_download): {model_name} → {output_dir} "
+            f"(共 {len(selected_files)} 个文件)"
         )
-        snapshot_download(**kwargs)
+
+        for repo_file in selected_files:
+            hf_hub_download(
+                repo_id=model_name,
+                filename=repo_file,
+                repo_type="model",
+                local_dir=str(output_dir),
+                endpoint=endpoint,
+            )
+
         _write_manifest(output_dir, model_name)
+        if not check_model_exists(output_dir):
+            logger.error(f"[ModelStore] 下载完成但未发现模型权重文件: {output_dir}")
+            return False, ["下载完成但未发现 .onnx / .xml 模型文件"]
+
         logger.info(f"[ModelStore] ✅ Chat 模型下载完成: {output_dir}")
         return True, []
 
@@ -235,15 +250,13 @@ def download_chat_model(
 
 
 def check_model_exists(model_dir: Path) -> bool:
-    """Return True if *model_dir* contains at least one ``*.onnx`` file
-    or an OpenVINO IR pair (``*.xml`` + ``*.bin``)."""
+    """Return True if *model_dir* or its subdirectories contain model files."""
     model_dir = Path(model_dir)
     if not model_dir.is_dir():
         return False
-    if any(True for _ in model_dir.glob("*.onnx")):
+    if any(True for _ in model_dir.rglob("*.onnx")):
         return True
-    # OpenVINO IR format
-    if any(True for _ in model_dir.glob("*.xml")):
+    if any(True for _ in model_dir.rglob("*.xml")):
         return True
     return False
 

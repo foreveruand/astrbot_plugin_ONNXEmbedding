@@ -78,7 +78,10 @@ class ONNXChatProvider(Provider):
             base_path if base_path.is_absolute() else data_dir / base_path
         )
 
-        self.backend: str = provider_config.get("ONNXChat_backend", "auto")
+        self.requested_backend: str = str(
+            provider_config.get("ONNXChat_backend", "auto")
+        )
+        self.backend: str = self._normalize_backend(self.requested_backend)
         self.device: str = provider_config.get("ONNXChat_device", "CPU")
         self.max_new_tokens: int = int(
             provider_config.get("ONNXChat_max_new_tokens", DEFAULT_MAX_NEW_TOKENS)
@@ -105,10 +108,39 @@ class ONNXChatProvider(Provider):
 
         logger.info(
             f"[ONNXChat] Provider 初始化完成 model_path={self.model_path} "
-            f"backend={self.backend} device={self.device} "
+            f"backend={self.requested_backend}->{self.backend} device={self.device} "
             f"env_available={self._env_available} "
             f"available_backend={self._available_backend}"
         )
+
+    @staticmethod
+    def _normalize_backend(value: str | None) -> str:
+        """Normalize backend aliases from config/UI values."""
+        raw = str(value or "auto").strip().lower()
+        alias_map = {
+            "auto": "auto",
+            "openvino": "openvino",
+            "ov": "openvino",
+            "onnx": "onnxruntime",
+            "ort": "onnxruntime",
+            "onnxruntime": "onnxruntime",
+            "onnx-runtime": "onnxruntime",
+        }
+        return alias_map.get(raw, raw or "auto")
+
+    @staticmethod
+    def _can_import_backend(backend: str) -> bool:
+        """Return True if the requested backend module can be imported."""
+        try:
+            if backend == "openvino":
+                import openvino_genai  # noqa: F401
+            elif backend == "onnxruntime":
+                import onnxruntime_genai  # noqa: F401
+            else:
+                return False
+            return True
+        except ImportError:
+            return False
 
     def _probe_backends(self) -> None:
         """Detect which inference backend is installed at init time."""
@@ -141,11 +173,22 @@ class ONNXChatProvider(Provider):
 
         if self._available_backend is None:
             self._env_available = False
-            self._env_error = (
-                "未安装本地推理后端，请安装以下任一套件：\n"
-                "  pip install openvino-genai      # Intel GPU/CPU 推荐\n"
-                "  pip install onnxruntime-genai   # 通用（CPU/CUDA）"
-            )
+            if self.backend == "openvino":
+                self._env_error = (
+                    "未安装 openvino-genai，请在 AstrBot 当前运行环境中执行："
+                    "pip install openvino-genai"
+                )
+            elif self.backend == "onnxruntime":
+                self._env_error = (
+                    "未安装 onnxruntime-genai，请在 AstrBot 当前运行环境中执行："
+                    "pip install onnxruntime-genai"
+                )
+            else:
+                self._env_error = (
+                    "未安装本地推理后端，请安装以下任一套件：\n"
+                    "  pip install openvino-genai      # Intel GPU/CPU 推荐\n"
+                    "  pip install onnxruntime-genai   # 通用（CPU/CUDA）"
+                )
 
     # ------------------------------------------------------------------
     # Provider abstract-method implementations
@@ -203,16 +246,85 @@ class ONNXChatProvider(Provider):
             )
             loop = asyncio.get_running_loop()
             self._pipeline = await loop.run_in_executor(None, self._load_pipeline)
-            logger.info(f"[ONNXChat] 模型加载成功 (backend={self._pipeline[0]})")
+            pipeline = self._pipeline
+            if pipeline is None:
+                raise RuntimeError("[ONNXChat] 模型加载失败：未返回有效的 pipeline")
+            logger.info(f"[ONNXChat] 模型加载成功 (backend={pipeline[0]})")
 
     def _load_pipeline(self) -> tuple:
-        model_path_str = str(self.model_path)
-        if self._available_backend == "openvino":
+        resolved = self._resolve_model_dir()
+        model_path_str = str(resolved)
+        has_openvino = any(resolved.glob("*.xml"))
+        has_onnx = any(resolved.glob("*.onnx"))
+
+        selected_backend = self.backend
+        if selected_backend == "auto":
+            if has_openvino and self._can_import_backend("openvino"):
+                selected_backend = "openvino"
+            elif has_onnx and self._can_import_backend("onnxruntime"):
+                selected_backend = "onnxruntime"
+            else:
+                selected_backend = self._available_backend or "auto"
+        elif selected_backend == "openvino" and not has_openvino and has_onnx:
+            if self._can_import_backend("onnxruntime"):
+                logger.warning(
+                    "[ONNXChat] 当前目录只有 ONNX 文件，自动切换到 onnxruntime 后端"
+                )
+                selected_backend = "onnxruntime"
+        elif selected_backend == "onnxruntime" and not has_onnx and has_openvino:
+            if self._can_import_backend("openvino"):
+                logger.warning(
+                    "[ONNXChat] 当前目录只有 OpenVINO IR 文件，自动切换到 openvino 后端"
+                )
+                selected_backend = "openvino"
+
+        logger.info(
+            f"[ONNXChat] 实际模型目录: {model_path_str} "
+            f"(requested={self.requested_backend}, normalized={self.backend}, selected={selected_backend})"
+        )
+
+        if selected_backend == "openvino":
+            if not has_openvino:
+                raise RuntimeError(
+                    "[ONNXChat] 目录中未找到 OpenVINO IR 模型文件 (*.xml/*.bin)"
+                )
             return self._load_openvino_pipeline(model_path_str)
-        elif self._available_backend == "onnxruntime":
+        if selected_backend == "onnxruntime":
+            if not has_onnx:
+                raise RuntimeError("[ONNXChat] 目录中未找到 ONNX 模型文件 (*.onnx)")
             return self._load_ortgenai_pipeline(model_path_str)
-        else:
-            raise RuntimeError("[ONNXChat] 无可用推理后端")
+
+        raise RuntimeError("[ONNXChat] 无可用推理后端")
+
+    def _resolve_model_dir(self) -> Path:
+        """Return the directory that actually contains model weight files.
+
+        Quantized model repos often place weights in a sub-folder (e.g. ``onnx/``,
+        ``openvino/``).  This method searches up to two levels deep and returns
+        the first directory that contains a ``.xml``, ``.bin``, or ``.onnx`` file.
+        Falls back to ``self.model_path`` if nothing is found.
+        """
+        root = self.model_path
+        # Check root first
+        if self._dir_has_model_files(root):
+            return root
+        # Check one level of subdirectories
+        if root.is_dir():
+            for sub in sorted(root.iterdir()):
+                if sub.is_dir() and self._dir_has_model_files(sub):
+                    logger.info(f"[ONNXChat] 在子目录找到模型文件: {sub}")
+                    return sub
+        return root
+
+    @staticmethod
+    def _dir_has_model_files(directory: Path) -> bool:
+        """Return True if *directory* contains any .xml, .onnx, or .bin file."""
+        if not directory.is_dir():
+            return False
+        for ext in ("*.xml", "*.onnx", "*.bin"):
+            if any(directory.glob(ext)):
+                return True
+        return False
 
     def _load_openvino_pipeline(self, model_path: str) -> tuple:
         import openvino_genai as ov_genai
