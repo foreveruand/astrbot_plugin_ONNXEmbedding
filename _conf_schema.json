@@ -22,5 +22,48 @@
     "description": "模型自动卸载超时时间（分钟，0表示禁用自动卸载）",
     "type": "int",
     "default": 0
+  },
+  "ONNXEmbedding_backend": {
+    "description": "Embedding 推理后端 (auto=自动检测, openvino=OpenVINO IR优先, onnxruntime=ONNX Runtime)",
+    "type": "string",
+    "enum": ["auto", "openvino", "onnxruntime"],
+    "enum_descriptions": ["自动", "OpenVINO", "ONNX Runtime"],
+    "default": "auto"
+  },
+  "ONNXRerank_backend": {
+    "description": "Rerank 推理后端 (auto=自动检测, openvino=OpenVINO IR优先, onnxruntime=ONNX Runtime)",
+    "type": "string",
+    "enum": ["auto", "openvino", "onnxruntime"],
+    "enum_descriptions": ["自动", "OpenVINO", "ONNX Runtime"],
+    "default": "auto"
+  },
+  "ONNXChat_backend": {
+    "description": "Chat 推理后端 (auto=自动检测, openvino=OpenVINO GenAI, onnxruntime=OnnxRuntime GenAI)",
+    "type": "string",
+    "enum": ["auto", "openvino", "onnxruntime"],
+    "enum_descriptions": ["自动", "OpenVINO GenAI", "ORT GenAI"],
+    "default": "auto"
+  },
+  "ONNXChat_device": {
+    "description": "Chat 推理设备",
+    "type": "string",
+    "enum": ["CPU", "GPU", "AUTO", "NPU"],
+    "enum_descriptions": ["CPU", "GPU", "自动", "NPU"],
+    "default": "CPU"
+  },
+  "ONNXChat_max_new_tokens": {
+    "description": "Chat 推理最大生成 token 数",
+    "type": "int",
+    "default": 512
+  },
+  "ONNXChat_temperature": {
+    "description": "Chat 推理温度 (0.0-2.0)",
+    "type": "float",
+    "default": 0.7
+  },
+  "ONNXChat_context_length": {
+    "description": "Chat 最大上下文长度（token 数）",
+    "type": "int",
+    "default": 2048
   }
 }

@@ -12,11 +12,14 @@ from typing import Any
 from urllib.request import urlretrieve
 
 import numpy as np
+
 from astrbot.api import logger
 from astrbot.core.provider.entities import ProviderType, RerankResult
 from astrbot.core.provider.provider import RerankProvider
-from astrbot.core.provider.register import register_provider_adapter
+from astrbot.core.provider.register import provider_cls_map, register_provider_adapter
 from astrbot.core.star import StarTools
+
+from ._plugin_config import get_plugin_config
 
 DEFAULT_RERANK_MODEL = "BAAI/bge-reranker-base"
 
@@ -77,8 +80,6 @@ def _download_rerank_model_from_hf(
 class ONNXRerankProvider(RerankProvider):
     def __init__(self, provider_config: dict, provider_settings: dict) -> None:
         super().__init__(provider_config, provider_settings)
-
-        from main import get_plugin_config
 
         plugin_config = get_plugin_config()
         self.hf_mirror = provider_config.get(
@@ -163,40 +164,90 @@ class ONNXRerankProvider(RerankProvider):
         tokenizer.enable_truncation(max_length=self.max_length)
         return tokenizer
 
-    def _load_onnx_session(self) -> Any:
+    def _resolve_model_file(self) -> tuple[Path, bool]:
+        """Return (model_file_or_ir_dir, is_openvino_ir)."""
         model_path = Path(self.model_path)
-
+        # OpenVINO IR: prefer openvino_model.xml inside the directory
         if model_path.is_dir():
+            ir_xml = model_path / "openvino_model.xml"
+            if ir_xml.exists():
+                return ir_xml, True
             onnx_files = list(model_path.glob("*.onnx"))
             if not onnx_files:
-                raise FileNotFoundError(f"在目录 {model_path} 中找不到ONNX模型文件")
-            model_path = onnx_files[0]
-
+                raise FileNotFoundError(
+                    f"在目录 {model_path} 中找不到 ONNX 或 IR 模型文件"
+                )
+            return onnx_files[0], False
+        if model_path.suffix == ".xml" and model_path.exists():
+            return model_path, True
         if not model_path.exists():
-            raise FileNotFoundError(f"找不到ONNX模型文件: {model_path}")
+            raise FileNotFoundError(f"找不到模型文件: {model_path}")
+        return model_path, False
 
-        try:
-            import openvino as ov
+    def _load_onnx_session(self) -> Any:
+        model_file, is_ir = self._resolve_model_file()
+        backend = self.provider_config.get("ONNXRerank_backend", "auto")
 
-            core = ov.Core()
-            devices = core.available_devices
-            preferred_device = "GPU" if "GPU" in devices else "CPU"
-            logger.info(
-                f"[ONNXRerank] OpenVINO 可用设备: {devices}, 使用: {preferred_device}"
-            )
-            compiled_model = core.compile_model(str(model_path), preferred_device)
-            logger.info("[ONNXRerank] 使用 OpenVINO 后端加载模型成功")
-            return ("openvino", compiled_model)
-        except ImportError:
-            logger.info("[ONNXRerank] OpenVINO 未安装，使用 ONNX Runtime")
-        except Exception as e:
-            logger.warning(f"[ONNXRerank] OpenVINO 加载失败: {e}，回退到 ONNX Runtime")
+        if backend in ("openvino", "auto"):
+            try:
+                import openvino as ov
 
+                core = ov.Core()
+                devices = core.available_devices
+                # Prefer GPU, then NPU, then CPU
+                preferred_device = "CPU"
+                for dev in ("GPU", "NPU"):
+                    if dev in devices:
+                        preferred_device = dev
+                        break
+
+                # Hint for quantized (INT8) models: allow cache to avoid re-compilation
+                ov_config: dict = {}
+                model_dir = (
+                    Path(self.model_path)
+                    if Path(self.model_path).is_dir()
+                    else Path(self.model_path).parent
+                )
+                cache_dir = model_dir / ".ov_cache"
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                core.set_property({"CACHE_DIR": str(cache_dir)})
+
+                logger.info(
+                    f"[ONNXRerank] OpenVINO 可用设备: {devices}, 使用: {preferred_device}"
+                )
+                compiled_model = core.compile_model(
+                    str(model_file), preferred_device, ov_config
+                )
+                logger.info(
+                    f"[ONNXRerank] OpenVINO 后端加载成功 "
+                    f"({'IR' if is_ir else 'ONNX'} format, device={preferred_device})"
+                )
+                return ("openvino", compiled_model)
+            except ImportError:
+                if backend == "openvino":
+                    raise RuntimeError("未安装 openvino，请执行：pip install openvino")
+                logger.info("[ONNXRerank] OpenVINO 未安装，使用 ONNX Runtime")
+            except Exception as exc:
+                if backend == "openvino":
+                    raise RuntimeError(f"OpenVINO 加载模型失败: {exc}") from exc
+                logger.warning(
+                    f"[ONNXRerank] OpenVINO 加载失败: {exc}，回退到 ONNX Runtime"
+                )
+
+        # ---- ONNX Runtime path ----
         import onnxruntime as ort
 
+        optimization_level = self.provider_config.get(
+            "ONNXRerank_optimization_level", "disable"
+        )
         sess_options = ort.SessionOptions()
-        sess_options.graph_optimization_level = (
-            ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+        _OPT_MAP = {
+            "all": ort.GraphOptimizationLevel.ORT_ENABLE_ALL,
+            "basic": ort.GraphOptimizationLevel.ORT_ENABLE_BASIC,
+            "extended": ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED,
+        }
+        sess_options.graph_optimization_level = _OPT_MAP.get(
+            optimization_level, ort.GraphOptimizationLevel.ORT_DISABLE_ALL
         )
 
         providers = ort.get_available_providers()
@@ -208,17 +259,30 @@ class ONNXRerankProvider(RerankProvider):
             "CPUExecutionProvider",
         ]
         selected_providers = [p for p in preferred_order if p in providers]
-
         logger.info(f"[ONNXRerank] ONNX Runtime 提供程序: {selected_providers}")
 
-        return (
-            "onnxruntime",
-            ort.InferenceSession(
-                str(model_path),
-                sess_options,
-                providers=selected_providers,
-            ),
-        )
+        try:
+            return (
+                "onnxruntime",
+                ort.InferenceSession(
+                    str(model_file),
+                    sess_options,
+                    providers=selected_providers,
+                ),
+            )
+        except Exception as exc:
+            logger.warning(f"[ONNXRerank] 加载模型失败，尝试关闭优化重试: {exc}")
+            sess_options.graph_optimization_level = (
+                ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+            )
+            return (
+                "onnxruntime",
+                ort.InferenceSession(
+                    str(model_file),
+                    sess_options,
+                    providers=selected_providers,
+                ),
+            )
 
     async def _ensure_model_loaded(self):
         self._ensure_env_available()
@@ -480,7 +544,10 @@ class ONNXRerankProvider(RerankProvider):
         return self._cleanup_resources()
 
 
-def register_ONNXRerankProvider():
+def register_ONNXRerankProvider() -> None:
+    if "ONNXRerank" in provider_cls_map:
+        logger.debug("[ONNXRerank] Provider 已存在，跳过注册")
+        return
     try:
         register_provider_adapter(
             "ONNXRerank",
@@ -489,4 +556,4 @@ def register_ONNXRerankProvider():
         )(ONNXRerankProvider)
         logger.info("[ONNXRerank] Provider 已注册")
     except ValueError:
-        logger.info("[ONNXRerank] Provider 已存在，跳过注册")
+        logger.debug("[ONNXRerank] Provider 已存在（race），跳过")

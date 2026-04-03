@@ -1,3 +1,8 @@
 onnxruntime>=1.15.0
 tokenizers>=0.13.0
 numpy>=1.24.0
+# Optional: OpenVINO backend (recommended for quantized models)
+openvino>=2024.0
+openvino-genai>=2024.4  # for ONNXChatProvider with OpenVINO
+# Optional: ONNX Runtime GenAI (fallback chat backend)
+onnxruntime-genai>=0.4.0

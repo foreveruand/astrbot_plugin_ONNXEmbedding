@@ -1,6 +1,5 @@
 """下载 Hugging Face ONNX 模型的脚本"""
 
-import os
 import sys
 from pathlib import Path
 from urllib.request import urlretrieve
@@ -67,9 +66,9 @@ def download_model(
             # 某些文件可能不存在，继续下载其他文件
             continue
 
-    print(f"\n✅ 模型下载完成！")
+    print("\n✅ 模型下载完成！")
     print(f"模型路径: {output_dir}")
-    print(f"\n在 AstrBot 配置中使用以下路径:")
+    print("\n在 AstrBot 配置中使用以下路径:")
     print(f"  ONNXEmbedding_path: {output_dir.absolute()}")
     print(
         f"  ONNXEmbedding_tokenizer_path: {(output_dir / 'tokenizer.json').absolute()}"
