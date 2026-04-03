@@ -29,6 +29,7 @@ import asyncio
 import gc
 import json
 import os  # noqa: F401 (required by openvino_genai)
+import re
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any, Literal
@@ -669,6 +670,28 @@ class ONNXChatProvider(Provider):
         parts.append("Assistant:")
         return "\n".join(parts)
 
+    @staticmethod
+    def _extract_reasoning_from_completion(completion: str | None) -> tuple[str, str]:
+        """Split Qwen-style `<think>...</think>` blocks from the visible answer."""
+        completion_text = str(completion or "")
+        if not completion_text:
+            return "", ""
+
+        reasoning_pattern = re.compile(
+            r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE
+        )
+        matches = reasoning_pattern.findall(completion_text)
+        reasoning_content = "\n".join(
+            [match.strip() for match in matches if str(match).strip()]
+        )
+
+        cleaned_text = reasoning_pattern.sub("", completion_text).strip()
+        # Also clean up orphan tags that some models leak to the final text.
+        cleaned_text = re.sub(
+            r"</?think>\s*", "", cleaned_text, flags=re.IGNORECASE
+        ).strip()
+        return cleaned_text, reasoning_content
+
     # ------------------------------------------------------------------
     # Synchronous inference helpers (run in executor)
     # ------------------------------------------------------------------
@@ -751,8 +774,21 @@ class ONNXChatProvider(Provider):
                 text_prompt,
             )
 
-        result_chain = MessageChain().message(completion)
-        return LLMResponse(role="assistant", result_chain=result_chain)
+        visible_text, reasoning_content = self._extract_reasoning_from_completion(
+            str(completion)
+        )
+        if not visible_text and not reasoning_content:
+            visible_text = str(completion).strip()
+
+        result_chain = MessageChain()
+        if visible_text:
+            result_chain = result_chain.message(visible_text)
+
+        return LLMResponse(
+            role="assistant",
+            result_chain=result_chain,
+            reasoning_content=reasoning_content,
+        )
 
     async def text_chat_stream(
         self,

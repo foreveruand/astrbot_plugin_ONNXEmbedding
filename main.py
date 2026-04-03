@@ -675,7 +675,7 @@ def register_ONNXEmbeddingProvider() -> None:
 _ONNX_PROVIDER_TYPES = frozenset({"ONNXEmbedding", "ONNXRerank", "ONNXChatProvider"})
 
 
-@register("ONNXEmbedding", "AstrBot", "ONNX Embedding Provider", "2.1.0")
+@register("ONNXEmbedding", "AstrBot", "ONNX Embedding Provider", "2.2.0")
 class ONNXEmbedding(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -808,7 +808,10 @@ class ONNXEmbedding(Star):
 
     @filter.command("onnx")
     async def query_kb(
-        self, event: AstrMessageEvent, kb_name: str, query_text: GreedyStr = ""
+        self,
+        event: AstrMessageEvent,
+        kb_name: str,
+        query_text: GreedyStr | str = "",
     ):
         """查询知识库: /onnx <知识库名> <查询内容>"""
         if not query_text:
@@ -862,7 +865,7 @@ class ONNXEmbedding(Star):
         self,
         event: AstrMessageEvent,
         model_type: str = "",
-        model_name: GreedyStr = "",
+        model_name: GreedyStr | str = "",
     ):
         """下载模型: /onnx_dl <类型> <模型名>
         类型: embed | rerank | chat
@@ -889,15 +892,15 @@ class ONNXEmbedding(Star):
             )
             return
 
-        model_name = model_name.strip()
+        model_name_text = str(model_name).strip()
         data_dir = Path(StarTools.get_data_dir("ONNXEmbedding"))
-        output_dir = data_dir / model_name.replace("/", "_")
+        output_dir = data_dir / model_name_text.replace("/", "_")
         hf_mirror = self.config.get("huggingface_mirror", "")
 
         if model_type == "chat":
             label = "ONNXChatProvider"
             yield event.plain_result(
-                f"[ONNXEmbedding] 开始下载 {label} 模型: {model_name}\n"
+                f"[ONNXEmbedding] 开始下载 {label} 模型: {model_name_text}\n"
                 f"目标路径: {output_dir}\n"
                 "(使用 snapshot 下载，包括模型权重文件)"
             )
@@ -906,7 +909,12 @@ class ONNXEmbedding(Star):
             loop = _aio.get_running_loop()
             try:
                 ok, failed = await loop.run_in_executor(
-                    None, download_chat_model, model_name, output_dir, hf_mirror, "auto"
+                    None,
+                    download_chat_model,
+                    model_name_text,
+                    output_dir,
+                    hf_mirror,
+                    "auto",
                 )
             except Exception as exc:
                 yield event.plain_result(f"[ONNXEmbedding] 下载出错: {exc}")
@@ -914,7 +922,7 @@ class ONNXEmbedding(Star):
         else:
             label, file_list = _EMBED_RERANK_MAP[model_type]
             yield event.plain_result(
-                f"[ONNXEmbedding] 开始下载 {label} 模型: {model_name}\n"
+                f"[ONNXEmbedding] 开始下载 {label} 模型: {model_name_text}\n"
                 f"目标路径: {output_dir}"
             )
             import asyncio as _aio
@@ -922,7 +930,12 @@ class ONNXEmbedding(Star):
             loop = _aio.get_running_loop()
             try:
                 ok, failed = await loop.run_in_executor(
-                    None, download_model, model_name, output_dir, file_list, hf_mirror
+                    None,
+                    download_model,
+                    model_name_text,
+                    output_dir,
+                    file_list,
+                    hf_mirror,
                 )
             except Exception as exc:
                 yield event.plain_result(f"[ONNXEmbedding] 下载出错: {exc}")
@@ -930,7 +943,7 @@ class ONNXEmbedding(Star):
 
         if ok:
             yield event.plain_result(
-                f"[ONNXEmbedding] ✅ {model_name} 下载完成: {output_dir}"
+                f"[ONNXEmbedding] ✅ {model_name_text} 下载完成: {output_dir}"
             )
         else:
             yield event.plain_result(
