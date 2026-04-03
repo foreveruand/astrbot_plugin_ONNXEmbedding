@@ -37,15 +37,20 @@ RERANK_FILES: list[tuple[str, str, bool]] = [
     ("special_tokens_map.json", "特殊 token 映射", False),
 ]
 
-#: Files expected for GenAI (quantized LLM) models
-#: The actual model weights (.onnx / .bin+.xml) must already be present;
-#: we only download auxiliary metadata files here.
+#: Files downloaded for GenAI models when huggingface_hub is unavailable (fallback only).
+#: Prefer ``download_chat_model()`` which downloads model weights via snapshot_download.
 CHAT_FILES: list[tuple[str, str, bool]] = [
     ("config.json", "模型配置", True),
     ("tokenizer.json", "Tokenizer", True),
     ("tokenizer_config.json", "Tokenizer 配置", False),
     ("special_tokens_map.json", "特殊 token 映射", False),
     ("generation_config.json", "生成配置", False),
+    # OpenVINO IR weights (present on Intel HF repos)
+    ("openvino_model.xml", "OpenVINO 模型描述 (xml)", False),
+    ("openvino_model.bin", "OpenVINO 模型权重 (bin)", False),
+    # ORT GenAI weights
+    ("model.onnx", "ONNX 模型文件", False),
+    ("model.onnx.data", "ONNX 模型数据 (large)", False),
 ]
 
 _MANIFEST_FILENAME = ".onnx_manifest.json"
@@ -149,6 +154,84 @@ def download_model(
     _write_manifest(output_dir, model_name)
     logger.info(f"[ModelStore] ✅ 模型 {model_name} 下载完成: {output_dir}")
     return True, []
+
+
+def download_chat_model(
+    model_name: str,
+    output_dir: Path,
+    hf_mirror: str = "",
+    backend: str = "auto",
+) -> tuple[bool, list[str]]:
+    """Download a quantized LLM for local GenAI inference.
+
+    Uses ``huggingface_hub.snapshot_download`` which correctly handles LFS
+    weight files and arbitrary per-model file layouts.  Falls back to the
+    simpler ``download_model()`` if *huggingface_hub* is not installed.
+
+    Args:
+        model_name: HuggingFace model slug, e.g. ``"Intel/neural-chat-7b-v3-3-int4-ov"``.
+        output_dir: Local directory to write files into.
+        hf_mirror: Optional HuggingFace endpoint/mirror (e.g. ``"https://hf-mirror.com"``).
+        backend: ``"openvino"`` | ``"onnxruntime"`` | ``"auto"`` — determines which
+            weight files to include via ``allow_patterns``.
+
+    Returns:
+        ``(success, error_messages)``
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build allow/ignore patterns based on target backend
+    base_patterns = ["*.json", "*.txt", "tokenizer.model", "*.tiktoken"]
+    weight_patterns: list[str] = []
+    if backend in ("openvino", "auto"):
+        weight_patterns += ["*.xml", "*.bin"]
+    if backend in ("onnxruntime", "auto"):
+        weight_patterns += ["*.onnx", "*.onnx.data"]
+    allow_patterns = base_patterns + weight_patterns
+
+    # Skip original training weights — we only need already-quantized artifacts
+    ignore_patterns = [
+        "pytorch_model*.bin",
+        "model.safetensors*",
+        "*.msgpack",
+        "*.h5",
+        "flax_model*",
+        "tf_model*.h5",
+        "rust_model.ot",
+        "training_args.bin",
+    ]
+
+    try:
+        from huggingface_hub import snapshot_download
+
+        kwargs: dict = {
+            "repo_id": model_name,
+            "local_dir": str(output_dir),
+            "allow_patterns": allow_patterns,
+            "ignore_patterns": ignore_patterns,
+        }
+        if hf_mirror:
+            kwargs["endpoint"] = hf_mirror.rstrip("/")
+
+        logger.info(
+            f"[ModelStore] 开始下载 Chat 模型 (snapshot): {model_name} → {output_dir}"
+        )
+        snapshot_download(**kwargs)
+        _write_manifest(output_dir, model_name)
+        logger.info(f"[ModelStore] ✅ Chat 模型下载完成: {output_dir}")
+        return True, []
+
+    except ImportError:
+        logger.warning(
+            "[ModelStore] huggingface_hub 未安装，回退到逐文件下载。"
+            "建议: pip install 'huggingface_hub>=0.20'"
+        )
+        return download_model(model_name, output_dir, CHAT_FILES, hf_mirror)
+
+    except Exception as exc:
+        logger.error(f"[ModelStore] Chat 模型下载失败: {exc}", exc_info=True)
+        return False, [str(exc)]
 
 
 def check_model_exists(model_dir: Path) -> bool:

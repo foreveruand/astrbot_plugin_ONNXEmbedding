@@ -41,7 +41,7 @@ from astrbot.core.provider.register import provider_cls_map, register_provider_a
 from astrbot.core.star import StarTools
 
 from ._plugin_config import get_plugin_config
-from .model_store import CHAT_FILES, check_model_exists, download_model
+from .model_store import check_model_exists, download_chat_model
 
 DEFAULT_CHAT_MODEL = "microsoft/phi-2"
 DEFAULT_MAX_NEW_TOKENS = 512
@@ -187,11 +187,11 @@ class ONNXChatProvider(Provider):
                 loop = asyncio.get_running_loop()
                 ok, _ = await loop.run_in_executor(
                     None,
-                    download_model,
+                    download_chat_model,
                     model_name,
                     self.model_path,
-                    CHAT_FILES,
                     self.hf_mirror,
+                    self._available_backend or "auto",
                 )
                 if not ok:
                     raise RuntimeError(f"[ONNXChat] 模型下载失败: {model_name}")

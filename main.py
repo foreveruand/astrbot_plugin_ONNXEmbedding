@@ -28,10 +28,10 @@ from astrbot.core.star.filter.command import GreedyStr
 from ._plugin_config import get_plugin_config, update_plugin_config
 from .chat_provider import register_ONNXChatProvider
 from .model_store import (
-    CHAT_FILES,
     EMBEDDING_FILES,
     RERANK_FILES,
     detect_model_precision,
+    download_chat_model,
     download_model,
     read_manifest,
 )
@@ -710,6 +710,9 @@ class ONNXEmbedding(Star):
             logger.error("[ONNXEmbedding] AstrBot 配置结构异常，无法注册 Provider 模板")
             return
 
+        # huggingface_mirror and auto_download are intentionally omitted from
+        # provider templates — they are plugin-level settings read from the
+        # shared plugin config by each provider's __init__.
         tmpl.setdefault(
             "ONNXEmbedding",
             {
@@ -717,8 +720,6 @@ class ONNXEmbedding(Star):
                 "type": "ONNXEmbedding",
                 "provider": "Local",
                 "ONNXEmbedding_path": DEFAULT_MODEL_NAME,
-                "huggingface_mirror": self.config.get("huggingface_mirror", ""),
-                "auto_download": self.config.get("auto_download", 1),
                 "auto_unload_timeout": self.config.get("auto_unload_timeout", 0),
                 "ONNXEmbedding_backend": "auto",
                 "provider_type": "embedding",
@@ -735,8 +736,6 @@ class ONNXEmbedding(Star):
                 "provider": "Local",
                 "ONNXRerank_path": "BAAI/bge-reranker-base",
                 "ONNXRerank_backend": "auto",
-                "huggingface_mirror": self.config.get("huggingface_mirror", ""),
-                "auto_download": self.config.get("auto_download", 1),
                 "provider_type": "rerank",
                 "enable": True,
             },
@@ -754,8 +753,6 @@ class ONNXEmbedding(Star):
                 "ONNXChat_max_new_tokens": 512,
                 "ONNXChat_temperature": 0.7,
                 "ONNXChat_context_length": 2048,
-                "huggingface_mirror": self.config.get("huggingface_mirror", ""),
-                "auto_download": 0,
                 "provider_type": "chat_completion",
                 "enable": True,
             },
@@ -880,39 +877,56 @@ class ONNXEmbedding(Star):
             )
             return
 
-        _TYPE_MAP = {
+        _EMBED_RERANK_MAP = {
             "embed": ("ONNXEmbedding", EMBEDDING_FILES),
             "embedding": ("ONNXEmbedding", EMBEDDING_FILES),
             "rerank": ("ONNXRerank", RERANK_FILES),
-            "chat": ("ONNXChatProvider", CHAT_FILES),
         }
-        if model_type not in _TYPE_MAP:
+        _valid_types = list(_EMBED_RERANK_MAP) + ["chat"]
+        if model_type not in _valid_types:
             yield event.plain_result(
                 f"[ONNXEmbedding] 未知类型 '{model_type}'，支持: embed / rerank / chat"
             )
             return
 
-        label, file_list = _TYPE_MAP[model_type]
         model_name = model_name.strip()
         data_dir = Path(StarTools.get_data_dir("ONNXEmbedding"))
         output_dir = data_dir / model_name.replace("/", "_")
-
         hf_mirror = self.config.get("huggingface_mirror", "")
-        yield event.plain_result(
-            f"[ONNXEmbedding] 开始下载 {label} 模型: {model_name}\n"
-            f"目标路径: {output_dir}"
-        )
 
-        import asyncio as _aio
-
-        loop = _aio.get_running_loop()
-        try:
-            ok, failed = await loop.run_in_executor(
-                None, download_model, model_name, output_dir, file_list, hf_mirror
+        if model_type == "chat":
+            label = "ONNXChatProvider"
+            yield event.plain_result(
+                f"[ONNXEmbedding] 开始下载 {label} 模型: {model_name}\n"
+                f"目标路径: {output_dir}\n"
+                "(使用 snapshot 下载，包括模型权重文件)"
             )
-        except Exception as exc:
-            yield event.plain_result(f"[ONNXEmbedding] 下载出错: {exc}")
-            return
+            import asyncio as _aio
+
+            loop = _aio.get_running_loop()
+            try:
+                ok, failed = await loop.run_in_executor(
+                    None, download_chat_model, model_name, output_dir, hf_mirror, "auto"
+                )
+            except Exception as exc:
+                yield event.plain_result(f"[ONNXEmbedding] 下载出错: {exc}")
+                return
+        else:
+            label, file_list = _EMBED_RERANK_MAP[model_type]
+            yield event.plain_result(
+                f"[ONNXEmbedding] 开始下载 {label} 模型: {model_name}\n"
+                f"目标路径: {output_dir}"
+            )
+            import asyncio as _aio
+
+            loop = _aio.get_running_loop()
+            try:
+                ok, failed = await loop.run_in_executor(
+                    None, download_model, model_name, output_dir, file_list, hf_mirror
+                )
+            except Exception as exc:
+                yield event.plain_result(f"[ONNXEmbedding] 下载出错: {exc}")
+                return
 
         if ok:
             yield event.plain_result(
